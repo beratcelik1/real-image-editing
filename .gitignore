@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+.DS_Store
+*.pth
+*.ckpt
+*.safetensors
+outputs/
+data/
+*.docx
+*.pdf
+wandb/
+.env
