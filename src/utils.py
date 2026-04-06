@@ -25,9 +25,7 @@ def get_device() -> torch.device:
 
 
 def get_dtype(device: torch.device) -> torch.dtype:
-    """float16 on CUDA, float32 elsewhere."""
-    if device.type == "cuda":
-        return torch.float16
+    """Always float32 — eliminates dtype mismatch bugs. A100 handles it fine."""
     return torch.float32
 
 
