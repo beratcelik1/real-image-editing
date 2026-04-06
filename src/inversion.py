@@ -76,13 +76,13 @@ def _ddim_inversion_step(
     else:
         next_timestep = scheduler.timesteps[timestep_idx - 1]
 
-    # alpha and alpha_prev for the DDIM formula (move to sample device)
-    dev = sample.device
-    alpha_prod_t = scheduler.alphas_cumprod[prev_timestep].to(dev)
+    # alpha and alpha_prev for the DDIM formula (match sample device + dtype)
+    dev, dt = sample.device, sample.dtype
+    alpha_prod_t = scheduler.alphas_cumprod[prev_timestep].to(dev, dtype=dt)
     alpha_prod_t_next = (
-        scheduler.alphas_cumprod[next_timestep].to(dev)
+        scheduler.alphas_cumprod[next_timestep].to(dev, dtype=dt)
         if next_timestep >= 0
-        else scheduler.final_alpha_cumprod.to(dev)
+        else scheduler.final_alpha_cumprod.to(dev, dtype=dt)
     )
 
     # Predict x_0 from current sample
@@ -112,12 +112,12 @@ def _ddim_step_inline(
     else:
         prev_timestep = 0
 
-    dev = sample.device
-    alpha_prod_t = scheduler.alphas_cumprod[timestep].to(dev)
+    dev, dt = sample.device, sample.dtype
+    alpha_prod_t = scheduler.alphas_cumprod[timestep].to(dev, dtype=dt)
     alpha_prod_prev = (
-        scheduler.alphas_cumprod[prev_timestep].to(dev)
+        scheduler.alphas_cumprod[prev_timestep].to(dev, dtype=dt)
         if prev_timestep >= 0
-        else scheduler.final_alpha_cumprod.to(dev)
+        else scheduler.final_alpha_cumprod.to(dev, dtype=dt)
     )
 
     # Predict x_0
