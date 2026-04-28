@@ -15,7 +15,7 @@ Read the [research proposal](RESEARCH_PROPOSAL.md) for motivation and
 the architectural arguments. This plan assumes you understand:
 - Section 3.1 (PEZ-1)
 - Section 3.2 (PEZ-2)
-- Section 3.3 (P2P/PnP integration)
+- Section 3.3 (P2P integration)
 - Appendix A (LocalBlend)
 
 ---
@@ -131,7 +131,6 @@ class EditConfig:
     sd_model: str
     ddim: dict           # nested; could be a sub-dataclass if preferred
     cross_attention: dict
-    self_attention: dict
     alignment_method: str
     device: str
     dtype: str
@@ -491,20 +490,17 @@ findings in [`docs/pez_conditional/DESIGN_CHOICES.md`](docs/pez_conditional/DESI
 - [Appendix A of the research proposal](RESEARCH_PROPOSAL.md#appendix-a--localblend-specification)
 - [`docs/p2p_pnp/DESIGN_CHOICES.md`](docs/p2p_pnp/DESIGN_CHOICES.md)
   for any decisions already recorded
-- The existing controllers in
+- The existing controller in
   [`attention_control/cross_attention.py`](attention_control/cross_attention.py)
-  and
-  [`attention_control/self_attention.py`](attention_control/self_attention.py)
   to understand the integration points
 
 ```python
 class LocalBlend:
-    """Shared mask state for P2P + PnP injection gating.
+    """Mask state for P2P cross-attention injection gating.
 
-    Build it from the unmapped target token positions; both
-    CrossAttentionController and SelfAttentionController consult it
-    to decide where to inject vs. where to leave the target alone
-    so new content can render.
+    Build it from the unmapped target token positions; the
+    CrossAttentionController consults it to decide where to inject
+    vs. where to leave the target alone so new content can render.
     """
 
     def __init__(
@@ -518,23 +514,23 @@ class LocalBlend:
     ) -> None: ...
 
     def step(self) -> None:
-        """Idempotent: tracks _finalized_for_step counter so it runs
-        once per denoising step regardless of which controller calls it."""
+        """Idempotent (forward-compat reserve): _finalized_step_id
+        guard makes this safe under any caller pattern."""
 
     def get_mask(self, spatial_resolution: int) -> torch.Tensor | None: ...
 
     def reset(self) -> None: ...
 ```
 
-Then **modify** the existing controllers to optionally accept a
+Then **modify** `CrossAttentionController` to optionally accept a
 `local_blend: LocalBlend | None` parameter:
 
 - `CrossAttentionController.__call__`: call
   `local_blend.record_cross_attention(attn_weights)` after computing
   attention but before P2P injection. Modify `_word_swap` to gate the
   column copy by the mask (see Appendix A code sketch in the proposal).
-- `SelfAttentionController._inject`: same gating idea applied to the
-  self-attention replacement.
+- `CrossAttentionController.step()` calls `local_blend.step()` at the
+  end of each denoising step to advance the mask state.
 
 **Configs read:** [`configs/local_blend.yaml`](configs/local_blend.yaml) →
 `LocalBlendConfig`.
@@ -647,11 +643,10 @@ def edit_image(
          src/inversion.py).
       6. align_pez_prompts(source_token_ids, target_token_ids)
          → mapping, unmapped_target
-      7. Set up CrossAttentionController, SelfAttentionController, and
-         CombinedAttnProcessor with local_blend, configured by
-         load_edit() with edit_overrides applied.
-                ↑ KNOB 2: edit_overrides controls (cross_replace_steps,
-                  self_replace_steps)
+      7. Set up CrossAttentionController with local_blend, configured
+         by load_edit() with edit_overrides applied. Register the
+         controller's processor on the U-Net's cross-attention layers.
+                ↑ KNOB 2: edit_overrides controls cross_replace_steps
       8. Run editing denoising loop with [source, target] batch
          using the source's z_T as the starting noise.
       9. Decode, save, return.
@@ -678,12 +673,9 @@ KNOB_1_SETTINGS = {
     "aggressive":   {"lambda_instruction": 3.0, "gamma_anchor": 0.01},
 }
 KNOB_2_SETTINGS = {
-    "subtle":   {"cross_attention.cross_replace_steps": 0.8,
-                 "self_attention.self_replace_steps": 0.5},
-    "moderate": {"cross_attention.cross_replace_steps": 0.5,
-                 "self_attention.self_replace_steps": 0.3},
-    "loud":     {"cross_attention.cross_replace_steps": 0.3,
-                 "self_attention.self_replace_steps": 0.1},
+    "subtle":   {"cross_attention.cross_replace_steps": 0.8},
+    "moderate": {"cross_attention.cross_replace_steps": 0.5},
+    "loud":     {"cross_attention.cross_replace_steps": 0.3},
 }
 
 for k1_name, k1 in KNOB_1_SETTINGS.items():
@@ -789,15 +781,15 @@ These should all pass before considering the basic pipeline complete.
 - Verify the warm-start initialization is actually being used (log the
   initial soft prompt vs. PEZ-1's vocab embeddings)
 
-**P2P/PnP edit produces no change vs. source:**
+**P2P edit produces no change vs. source:**
 - Verify the [source, target] batch is correctly stacked
 - Verify `mapping` has reasonable matched positions
-- Verify the controllers are actually registered (
-  `register_combined_control` ran without error)
+- Verify the cross-attention controller is actually registered on the
+  U-Net's cross-attention layers
 
 **Edit destroys structure (dog appears but pose changes):**
-- Increase `cross_replace_steps` (more P2P injection)
-- Increase `self_replace_steps` (more PnP structural transfer)
+- Increase `cross_replace_steps` (more P2P injection — keeps source
+  attention longer in the denoising trajectory)
 - Verify LocalBlend mask isn't covering the entire image (log
   `mask.sum() / mask.numel()` per step)
 

@@ -27,7 +27,7 @@
 > doesn't just automate what a user would do; it does it better than
 > the user could.**
 >
-> Existing P2P/PnP attention-editing machinery composes with PEZ-1 /
+> Existing P2P attention-editing machinery composes with PEZ-1 /
 > PEZ-2 outputs unchanged: they share most token positions (warm-start
 > property), so P2P alignment is trivial; positions affected by the
 > instruction differ between source and target, becoming the unmapped
@@ -45,7 +45,7 @@ A fresh agent picking this up should:
 
 1. Read sections 1 and 2 below for the framing.
 2. Skim section 3 (the core method) — pay attention to 3.1 (PEZ-1
-   on source), 3.2 (PEZ-2 instruction-conditioned), and 3.3 (P2P/PnP
+   on source), 3.2 (PEZ-2 instruction-conditioned), and 3.3 (P2P
    integration).
 3. Jump to **section 5** (codebase organization) and **section 7**
    (Phase R1) to start writing code.
@@ -131,7 +131,7 @@ twice with different conditioning:
    no rule-based parser, no learned task-specific model.**
 
 The two prompts (PEZ-1 → source, PEZ-2 → target) compose with existing
-P2P/PnP unchanged because:
+P2P unchanged because:
 
 - Most positions match (warm-start) → P2P alignment is trivial via
   token-ID matching
@@ -196,7 +196,7 @@ mostly working.
 A fully-automated real-image editing pipeline built from two PEZ
 optimizations — **PEZ-1** for source inversion and **PEZ-2** for
 instruction-conditioned target generation — composes with existing
-P2P/PnP attention-editing machinery without modification. Instruction
+P2P attention-editing machinery without modification. Instruction
 following emerges from CLIP's semantic alignments via PEZ-2's joint
 loss, requiring no LLM, no rule-based parser, and no task-specific
 learned model.
@@ -258,9 +258,9 @@ position).
 - **Risk level.** Medium. The mechanism is sound but the operating
   point is empirical. R2 characterizes (λ, γ) ranges that work.
 
-### Sub-claim 3 — P2P/PnP compose with PEZ-1/PEZ-2 outputs unchanged
+### Sub-claim 3 — P2P compose with PEZ-1/PEZ-2 outputs unchanged
 
-Existing P2P, PnP, and local-blend machinery — designed for natural-
+Existing P2P and local-blend machinery — designed for natural-
 language prompts — composes with PEZ-1 / PEZ-2 outputs without
 modification. **This is the architectural claim.**
 
@@ -268,16 +268,15 @@ modification. **This is the architectural claim.**
   Source and target prompts share most positions (warm-start). P2P
   alignment via token-ID matching trivially maps shared positions;
   unchanged positions get attention swap; modified positions are
-  unmapped and drive local-blend masking; PnP self-attention is
-  text-agnostic.
+  unmapped and drive local-blend masking.
 - **Measurement.** End-to-end editing quality on substitution and
-  additive edit splits (Section 4.4). Compare PEZ-1/PEZ-2 + P2P/PnP
+  additive edit splits (Section 4.4). Compare PEZ-1/PEZ-2 + P2P
   against:
   - Continuous TI + P2P (broken baseline)
   - BLIP-2 caption + hand-crafted target + P2P (natural-language
     ceiling, with human in the loop)
   - InstructPix2Pix (instruction-trained baseline)
-- **Failure mode.** PEZ outputs work for inversion but P2P/PnP edits
+- **Failure mode.** PEZ outputs work for inversion but P2P edits
   on top produce poor structural preservation. Would suggest PEZ-2's
   outputs have structural properties that fight against P2P's
   alignment expectations.
@@ -306,7 +305,7 @@ without breaking position-stability or P2P composability.
 |---|---|---|
 | 1 — PEZ-1 > captioning | Low–medium | Fall back to BLIP-2 for source; PEZ-2 still works on top of caption-derived source |
 | 2 — PEZ-2 produces correct targets | Medium | Tune (λ, γ) more carefully, or fall back to user-provided target descriptions |
-| 3 — P2P/PnP compose with PEZ outputs | Medium | Investigate why; may require token-order regularization in PEZ-1/PEZ-2 |
+| 3 — P2P compose with PEZ outputs | Medium | Investigate why; may require token-order regularization in PEZ-1/PEZ-2 |
 | 4 — Useful Pareto for refinement ε | Low | Operate at ε=0 (pure discrete); main architecture still works |
 
 The project's contribution lives or dies on **sub-claims 2 and 3**.
@@ -335,16 +334,16 @@ Per edit:
      PEZ-1 → target prompt
   3. (Optional) Bounded refinement on PEZ-1/PEZ-2 outputs
   4. DDIM-invert source under source prompt encoding
-  5. Run P2P/PnP edit:
+  5. Run P2P edit:
      - Token-ID matching aligns shared positions
+     - Cross-attention swap copies source attention at mapped positions
      - Differing positions are unmapped → drive local blend mask
-     - PnP transfers source self-attention text-agnostically
   6. Decode → edited image
 ```
 
 The whole pipeline is built from one PEZ algorithm (run twice with
 different conditioning), the existing inversion code, and the
-existing P2P/PnP machinery. **No new attention controllers, no LLM,
+existing P2P machinery. **No new attention controllers, no LLM,
 no rule-based parser, no learned task-specific model.** This is the
 demonstration in Section 11.
 
@@ -353,7 +352,7 @@ demonstration in Section 11.
 The architecture has three core pieces:
 - **3.1**: PEZ-1 — source-image inversion to discrete prompt
 - **3.2**: PEZ-2 — instruction-conditioned target generation
-- **3.3**: P2P/PnP integration
+- **3.3**: P2P integration
 
 Plus two supporting subsections:
 - **3.4**: Bounded continuous refinement (optional fidelity lever)
@@ -747,10 +746,10 @@ that the user gives a simple instruction and the system handles
 parsing, but that the system fills in details the user wouldn't have
 known to provide.
 
-### 3.3 P2P/PnP integration (sub-claim 3)
+### 3.3 P2P integration (sub-claim 3)
 
 **No modifications required.** This is a positive claim: existing
-P2P/PnP machinery composes with the PEZ-1 / PEZ-2 prompts unchanged.
+P2P machinery composes with the PEZ-1 / PEZ-2 prompts unchanged.
 We verify this rather than building anything new on the attention-
 editing side.
 
@@ -769,8 +768,6 @@ editing side.
   unmapped positions.** The mask spatially localizes where the edit
   should appear; outside the mask, source structure is preserved via
   P2P injection.
-- **PnP self-attention** is text-agnostic; copies source's patch-to-
-  patch self-attention to target. Independent of prompt structure.
 
 **Refinements (Section 3.4) live at the input to CLIP.** Δ_i
 perturbations are applied when looking up token embeddings; the
@@ -790,7 +787,7 @@ independently, combine at each diffusion step:
 We don't use this because:
 
 1. It generates from scratch — doesn't preserve source structure.
-   Would still need DDIM inversion + P2P/PnP on top to get editing
+   Would still need DDIM inversion + P2P on top to get editing
    behavior.
 2. It blends globally — no spatial localization. Local blend (which
    we use) provides the spatial mechanism this approach lacks.
@@ -935,8 +932,6 @@ PER-EDIT:
   6. Run editing denoising loop with [source, target] batch:
      - CrossAttentionController copies source attention columns to
        target at mapped positions
-     - SelfAttentionController copies source self-attention to target
-       (PnP — text-agnostic)
      - LocalBlend uses target_token_indices = unmapped positions to
        build a spatial mask; injection is gated by the mask outside
        its boundary
@@ -949,8 +944,7 @@ works unchanged.** PEZ-2's warm-start ensures source and target share
 most token IDs at the same positions; P2P alignment via token-ID
 matching is therefore trivial. The positions that differ are exactly
 the edit regions, and they're naturally identified as unmapped — which
-is what local blend needs to localize the edit. PnP self-attention
-preserves source structure text-agnostically.
+is what local blend needs to localize the edit.
 
 No new attention controllers, no modifications to the existing
 denoising loop.
@@ -1008,16 +1002,16 @@ Expected finding: the **moderate** point is the right Knob-1 default;
 conservative and aggressive bracket the failure modes (no edit vs.
 broken alignment).
 
-### 4.3 P2P/PnP composability (sub-claim 3)
+### 4.3 P2P composability (sub-claim 3)
 
 For 30 (source image, instruction) pairs from the test set, run:
 
-- PEZ-1 + PEZ-2 + P2P/PnP edit (proposed full pipeline)
+- PEZ-1 + PEZ-2 + P2P edit (proposed full pipeline)
 - PEZ-1 + hand-crafted target prompt (human override of PEZ-2) +
-  P2P/PnP edit (controls for PEZ-2 quality)
+  P2P edit (controls for PEZ-2 quality)
 
 Compare structural preservation (SSIM outside edit region) between
-the two. If PEZ-2 produces target prompts that compose with P2P/PnP
+the two. If PEZ-2 produces target prompts that compose with P2P
 as well as hand-crafted targets do, sub-claim 3 holds. If structural
 preservation degrades with PEZ-2 vs. hand-crafted, the issue is
 PEZ-2 producing target prompts whose token structure doesn't align
@@ -1051,7 +1045,7 @@ operating points:
 Plus the standard baseline configurations (run at the moderate
 Knob-2 setting only):
 
-- **BLIP-2 caption + hand-crafted target + P2P/PnP**: human-in-the-loop
+- **BLIP-2 caption + hand-crafted target + P2P**: human-in-the-loop
   ceiling for caption-based editing.
 - **Continuous TI + P2P (broken baseline)**: continuous textual
   inversion injected at target positions.
@@ -1281,7 +1275,7 @@ LocalBlend module needed by R4.
 | Component | Status | When needed |
 |---|---|---|
 | Existing inversion (DDIM + null-text) in `src/inversion.py` | Required, unchanged | All phases that involve image reconstruction. |
-| Existing attention controllers (P2P + PnP) in `attention_control/` | Required, unchanged | Phase R4. The architectural claim is that these continue to work unchanged when fed PEZ-derived prompts. |
+| Existing attention controllers (P2P) in `attention_control/` | Required, unchanged | Phase R4. The architectural claim is that these continue to work unchanged when fed PEZ-derived prompts. |
 | Existing SD utility code in `src/utils.py` | Required, unchanged | All phases. |
 | New: `attention_control/local_blend.py` | Required (built when starting R4) | Phase R4. Specification in Appendix A. |
 | New: `src/semantic_alignment.py` | Optional fallback for R4 | Only if LCS alignment proves insufficient for PEZ outputs. Specification in Appendix B. |
@@ -1385,7 +1379,7 @@ to integrate with the existing inversion pipeline.
 ### Phase R2 — PEZ-2: instruction-conditioned target generation (sub-claims 2, 3)
 
 **Goal:** implement PEZ-2 (instruction-conditioned PEZ with warm-start
-from PEZ-1); ablate (λ, γ) hyperparameters; verify P2P/PnP composability
+from PEZ-1); ablate (λ, γ) hyperparameters; verify P2P composability
 with end-to-end edits on a few hand-picked test cases.
 
 **Files to create:**
@@ -1440,7 +1434,7 @@ with end-to-end edits on a few hand-picked test cases.
 - Recommended (λ, γ) operating range for each edit type
   (substitution / addition / attribute change / style change).
 - Hand-picked end-to-end editing demos showing PEZ-2's output composed
-  with P2P/PnP (LocalBlend not yet built, so use no-mask P2P).
+  with P2P (LocalBlend not yet built, so use no-mask P2P).
 
 **Expected finding:**
 
@@ -1539,7 +1533,7 @@ Estimated time: 2 weeks.
 ### Phase R4 — End-to-end editing evaluation (sub-claim 4 + paper)
 
 **Goal:** end-to-end editing experiments with the full PEZ-1 + PEZ-2
-+ P2P/PnP architecture vs. baselines; paper-grade writeup.
++ P2P architecture vs. baselines; paper-grade writeup.
 
 **Files to create:**
 
@@ -1560,15 +1554,14 @@ For each of 50 (source image, instruction) pairs:
 4. Compute LCS alignment between source and target token IDs.
 5. Set up controllers:
    - `CrossAttentionController` with the LCS mapping
-   - `SelfAttentionController` for PnP
    - `LocalBlend` with `target_token_indices` = unmapped target positions
 6. Run editing denoising loop.
 7. Save side-by-side comparisons:
    - Source image
    - Edit using **continuous TI + P2P** (broken baseline)
    - Edit using **InstructPix2Pix** (instruction-trained baseline)
-   - Edit using **BLIP-2 + hand-crafted target + P2P/PnP** (human ceiling)
-   - Edit using **proposed (PEZ-1 + PEZ-2 + P2P/PnP)**
+   - Edit using **BLIP-2 + hand-crafted target + P2P** (human ceiling)
+   - Edit using **proposed (PEZ-1 + PEZ-2 + P2P)**
 
 **What to produce:**
 
@@ -1754,6 +1747,48 @@ behavior. Users who phrase modal/intentional instructions get
 graceful degradation to the closest image-content interpretation.
 This is the expected operating envelope.
 
+### Edit-type envelope: P2P-style edits only
+
+The framework is designed around **P2P-style edits** — those that can
+be expressed as a localized change to a token-anchored prompt
+description of the source image. This covers the categories listed
+above (substitution, addition, attribute change, style change), but
+*not* edits that fall outside P2P's mechanism:
+
+- **Geometric edits** — `"rotate the head 30°"`, `"move the cup to the
+  left"`, `"flip the image"`. P2P's cross-attention column swap
+  preserves spatial layout from the inversion trajectory; it has no
+  mechanism to move or rotate content. These edits are out of scope.
+- **Multi-object compositional edits** — `"put the dog on top of the
+  cat and the cat on top of the table"`. P2P operates on a single
+  prompt-level edit at a time and inherits CLIP's poor handling of
+  binding/relations. Out of scope.
+- **Edits requiring novel scene structure** — `"add a second dog"`
+  (when the source has one), `"a crowd version of this"`. P2P
+  preserves the source's structural skeleton via the column swap;
+  introducing additional structural elements is at best unreliable
+  and typically out of scope.
+- **Pixel-precise edits** — `"recolor exactly this region"` with an
+  externally-supplied mask. P2P's LocalBlend mask is derived from
+  cross-attention to edit tokens, not from a user mask; this
+  framework does not expose a pixel-level mask interface.
+- **Identity-preserving edits across large semantic changes** —
+  `"the same person but as a child"`. Identity preservation through
+  large CLIP-distance moves is a separate research thread (DreamBooth,
+  Textual Inversion, identity-locking LoRAs); the discrete-token
+  inversion in PEZ-1 doesn't carry per-instance identity strongly
+  enough for this.
+
+The `LocalBlend` mask gives gentle help on **additive** P2P edits
+(masks the target's new content from being overwritten by source
+attention), but it doesn't expand the envelope to non-P2P edit types.
+
+If your use case requires edits outside this envelope, this framework
+is the wrong tool: pick InstructPix2Pix-style end-to-end editing
+models (for compositional/geometric edits), DreamBooth or LoRA
+fine-tuning (for identity-preserving large edits), or mask-conditioned
+inpainting (for pixel-precise region edits).
+
 ## 9. Related work and how this differs
 
 | Method | What it does | Why it doesn't solve our problem |
@@ -1761,8 +1796,8 @@ This is the expected operating envelope.
 | **PEZ / Hard Prompts Made Easy** (Wen 2023) | Discrete prompt search for image-to-text inversion | Foundation we build on; not previously applied as a source-representation primitive for attention-based editing, nor extended to instruction-conditioned target generation |
 | **Textual Inversion** (Gal 2022) | Learns single continuous-token concept embeddings | Continuous embeddings smear across contextual encodings, breaking P2P alignment; we use discrete tokens specifically to avoid this |
 | **DreamBooth** (Ruiz 2022) | Fine-tunes the U-Net for a specific concept | Modifies model weights; concept not transportable via prompt manipulation |
-| **InstructPix2Pix** (Brooks 2023) | Trains a diffusion model end-to-end for instruction-conditioned image editing | Replaces P2P/PnP entirely; requires bootstrapped training data via GPT-3; produces a black-box editing model rather than a compositional pipeline |
-| **Composable Diffusion** (Liu 2022) | Combines multiple text conditionings via composed CFG | Generates from scratch — no source structure preservation. Wouldn't compose with our P2P/PnP setup without adding the same machinery anyway |
+| **InstructPix2Pix** (Brooks 2023) | Trains a diffusion model end-to-end for instruction-conditioned image editing | Replaces P2P entirely; requires bootstrapped training data via GPT-3; produces a black-box editing model rather than a compositional pipeline |
+| **Composable Diffusion** (Liu 2022) | Combines multiple text conditionings via composed CFG | Generates from scratch — no source structure preservation. Wouldn't compose with our P2P setup without adding the same machinery anyway |
 | **Custom Diffusion** (Kumari 2022) | Optimizes K/V projections per concept | Composition lives in projection space; doesn't compose with P2P's prompt-side column-swap mechanism |
 | **P+** (Voynov 2023) | Per-layer textual inversion | Orthogonal — could combine with PEZ for richer per-layer discrete representations (Open Question 6) |
 | **Concept Sliders** (Gandikota 2023) | Trains directional axes between concepts | Different abstraction (continuous attribute axes); uses LoRAs not prompts |
@@ -1773,7 +1808,7 @@ This is the expected operating envelope.
 The contribution is **the two-PEZ architecture for instruction-
 conditioned editing** — PEZ-1 for source representation, PEZ-2 for
 instruction-conditioned target generation, both composing with existing
-P2P/PnP machinery unchanged. The instruction-following step is
+P2P machinery unchanged. The instruction-following step is
 embedding-space optimization (PEZ-2's joint loss) rather than parsing
 or LLM-based reasoning. No cited method does this — each solves a
 related but distinct piece.
@@ -1816,10 +1851,10 @@ A demo where:
      in the user's instruction. PEZ-2 found it by satisfying source
      visual properties simultaneously with instruction semantics.
    - DDIM-inverts the photo under PEZ-1's source encoding.
-   - Runs P2P/PnP edit. Token-ID matching aligns most positions; 
+   - Runs P2P edit. Token-ID matching aligns most positions; 
      the differing positions (`husky → bombay`, `thick → long`) are
      unmapped → drive the local-blend mask. P2P injects at unchanged
-     positions; PnP preserves spatial structure.
+     positions, preserving the source's structural skeleton.
 4. Output: **the same composition, in the same pose, on the same
    wooden table, with a black fluffy bombay cat in place of the
    husky** — visually coherent because the cat breed was chosen by
@@ -1903,10 +1938,11 @@ the unmapped target indices from LCS alignment).
 
 ```python
 class LocalBlend:
-    """Shared mask state for P2P + PnP injection gating.
+    """Mask state for P2P cross-attention injection gating.
 
-    Both CrossAttentionController and SelfAttentionController consult
-    this object to decide where to inject.
+    Attached to CrossAttentionController via its local_blend
+    parameter. The controller feeds and consults this object to
+    decide where to inject.
     """
 
     def __init__(
@@ -1927,8 +1963,9 @@ class LocalBlend:
 
     def step(self) -> None:
         """Finalize the current step's mask and store it for use at
-        the NEXT step. Reset accumulator. Idempotent: safe to call
-        from both controllers per step."""
+        the NEXT step. Reset accumulator. Idempotent (forward-compat
+        reserve): if a future v2 re-introduces a second controller,
+        both can call this safely."""
 
     def get_mask(self, spatial_resolution: int) -> torch.Tensor:
         """Return the current mask resampled to the requested
@@ -1940,10 +1977,12 @@ class LocalBlend:
 
 ### Implementation notes
 
-- **Mask lifecycle**: cross-attention layers run AFTER self-attention
-  within each transformer block, so the mask used at step t is computed
-  from cross-attention maps at step t-1. Step 0 has no mask; injection
-  is unmasked.
+- **Mask lifecycle**: cross-attention is recorded during the layer's
+  forward pass and the accumulator is finalized at end-of-step, so the
+  mask used at step t comes from cross-attention recorded at step t-1.
+  Step 0 has no mask; injection is unmasked. (Even in the P2P-only
+  setup, the lag is structural — the mask is finalized in
+  `controller.step()` which is called after the U-Net forward.)
 - **Mask resolution**: cross-attention maps come at multiple spatial
   resolutions (8×8, 16×16, 32×32, 64×64 for SD2.1). Compute the mask
   at one canonical resolution (16×16 recommended), aggregate across
@@ -1973,12 +2012,12 @@ else:
                               + w * target[:, :, :, tgt_tok]
 ```
 
-`SelfAttentionController._inject`: similar gating in the self-attention
-replacement. `step()` advances the local blend's step counter via the
-guarded idempotent `LocalBlend.step()`.
+`CrossAttentionController.step()` calls `local_blend.step()` to advance
+the mask state at the end of each denoising step.
 
-The same `LocalBlend` instance is shared between the cross- and self-
-attention controllers — that's how they coordinate.
+The idempotency guard on `LocalBlend.step()` is forward-compatible
+reserve — if v2 re-adds a second controller (e.g., PnP-as-toggle), the
+same `LocalBlend` instance can be shared without double-finalization.
 
 ---
 
