@@ -1626,13 +1626,15 @@ they shape the methodology:
      the optimization a more stable trajectory. Schedule design is
      non-trivial; deferred unless v1 alternating fails.
 
-2. **What instruction types does PEZ-2 handle well, and which fail?**
-   CLIP encodes `"change the animal into a cat"` as dominantly "cat".
-   But it handles negation and removal poorly. Characterize the
-   instruction-type taxonomy empirically in R2: which instructions
-   produce sensible target prompts and which don't. Likely strong:
-   substitution, addition, attribute change, style change. Likely
-   weak: removal, negation, comparative ("make it bigger").
+2. **Edit-type robustness within the supported instruction taxonomy.**
+   Within the instruction types PEZ-2 *can* handle (see Section 8a's
+   limitation taxonomy), some edits may still fail or behave
+   inconsistently. R1 should empirically characterize: across the
+   supported types (substitution, addition, attribute change, style
+   change), which specific edits produce sensible target prompts and
+   which don't, and what (λ, γ) settings work across the most types.
+   This is the empirical "operating envelope" of PEZ-2 within its
+   supported scope.
 
 3. **(λ, γ) operating range.** R2 ablates the joint loss
    coefficients. Open question: is there a single (λ, γ) that works
@@ -1666,6 +1668,91 @@ they shape the methodology:
    et al. 2023) shows per-layer embeddings capture concepts more
    richly. Could PEZ-1 / PEZ-2 extend to the per-layer setting? Likely
    yes but adaptation needed.
+
+## 8a. Known limitations (not pursued in v1 or v2)
+
+The following are explicit limitations of the proposed architecture
+that the project does not aim to resolve. Listed for honest scoping
+and so users / reviewers know what to expect.
+
+### Instruction encoding is image-content-biased
+
+PEZ-2's `L_instruction` term uses CLIP text-text cosine similarity
+between the prompt's pooled CLIP encoding and the instruction's
+pooled CLIP encoding. CLIP was trained on caption-image pairs from
+the web — captions describe what's *in* images, not preferences,
+intentions, mental states, counterfactuals, comparatives, or modal
+statements. The pooled CLIP encoding therefore compresses natural-
+language instructions toward "what would an image of this look
+like." Modal/intentional words get washed out by content nouns.
+
+**Categories of instruction the system handles well:**
+- **Substitution** — `"change X to Y"`, `"replace X with Y"`. CLIP
+  encoding has Y as dominant content; PEZ-2 finds a token shifting
+  X → Y at the appropriate prompt position.
+- **Addition** — `"add a Y"`, `"with a Y"`, `"wearing a Y"`. Same
+  mechanism; Y dominates.
+- **Attribute change** — `"make it brown"`, `"turn its X red"`. The
+  attribute dominates the encoding.
+- **Style change** — `"make it black and white"`, `"in oil painting
+  style"`. The style descriptor dominates.
+
+**Categories that fail or degrade gracefully:**
+- **Behavioral / preference / mental-state instructions** — e.g.,
+  `"make the animal like eating fish more"`. CLIP's pooled encoding
+  is dominated by "fish" (the concrete content noun). The user's
+  intent — the animal's preference — is not in CLIP's representation
+  vocabulary. The system's behavior is *graceful degradation toward
+  the closest image-content interpretation*: it produces a target
+  prompt resembling "an animal eating fish," ignoring the modal
+  ("like") and comparative ("more") qualifiers entirely. Result is
+  a coherent edit semantically adjacent to but not identical to the
+  user's intent.
+- **Negation** — `"make it not red"`. CLIP doesn't represent negation
+  well; the encoding still has "red" as a dominant signal. Likely to
+  produce something red rather than something non-red.
+- **Counterfactuals** — `"as if X had never happened"`. Modal/
+  counterfactual semantics aren't in CLIP. Unpredictable behavior.
+- **Comparatives without referents** — `"make it bigger"`. CLIP
+  doesn't have a strong "bigger" axis without a comparison anchor.
+  Likely no-op or wrong direction.
+- **Removal** — `"remove the dog"`. Slightly better than negation
+  (CLIP can encode absence weakly via context), but still
+  unreliable.
+
+### Why we don't fix this
+
+The fix requires either:
+
+- **An LLM in the pipeline** (translate intent into image-content
+  description before PEZ-2). The project explicitly rejects this
+  to avoid LLM dependencies.
+- **A custom instruction encoder** trained on (instruction, edited
+  image) pairs that maps semantic intent directly into editing-
+  appropriate embedding space. Major training effort plus needs
+  paired data we don't have.
+- **Fine-tuning CLIP on edit-instruction language**. Same data
+  problem; significant compute cost.
+
+None of these is in the project's scope for v1 or v2. The graceful-
+degradation behavior is the cost of avoiding an LLM dependency.
+
+### How users should phrase instructions
+
+For best results, phrase instructions as **descriptions of the
+desired image content**, not as imperatives or modal statements:
+
+| Instead of | Phrase as |
+|---|---|
+| `"make the animal like eating fish more"` | `"add a fish in front of the animal"` (or accept the graceful degradation: `"animal eating fish"`) |
+| `"make it not red"` | `"make it blue"` or whatever specific color is desired |
+| `"make it bigger"` | `"a giant version of X"` if size relative to a referent is the intent |
+| `"remove the dog"` | `"a photo of an empty backyard"` (i.e., describe the desired post-edit content directly) |
+
+Users who phrase image-content instructions get strong PEZ-2
+behavior. Users who phrase modal/intentional instructions get
+graceful degradation to the closest image-content interpretation.
+This is the expected operating envelope.
 
 ## 9. Related work and how this differs
 
