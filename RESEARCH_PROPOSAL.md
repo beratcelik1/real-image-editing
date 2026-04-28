@@ -368,29 +368,174 @@ Each maps to one or more of the sub-claims in Section 2.
 ### 3.1 PEZ on the source image (sub-claim 1)
 
 **What it does.** Replaces BLIP-2 captioning with discrete prompt search
-to produce a source prompt directly optimized for the source image.
+to produce a source prompt directly optimized for *recovering the image
+through our pipeline*, not for from-scratch generation.
 
 **Algorithm.** PEZ (Wen et al. 2023) maintains a soft prompt — N
-continuous embedding vectors — that gets gradient updates against the
-CLIP-image-similarity loss. After each gradient step, each soft
-embedding is projected to its nearest CLIP vocabulary token (via
-nearest-neighbor in embedding space). The projection produces a
-discrete prompt; the gradient flow happens through the soft version.
-The result after ~1000–3000 steps is a sequence of N real CLIP
-vocabulary tokens whose embeddings collectively maximize similarity to
-the target image.
+continuous embedding vectors — and runs gradient updates with a
+straight-through projection to the nearest CLIP vocabulary tokens.
+We adapt the algorithm but **modify the loss** so that the prompt is
+optimized for our actual reconstruction pipeline rather than for
+matching CLIP-image similarity (which would be vanilla PEZ).
+
+**The reconstruction-aware loss.** Vanilla PEZ optimizes
+`L = -cos_sim(prompt_emb, image_emb)` — "find a prompt that, paired
+with random noise, would generate this image under SD." For our use
+case, the prompt is paired with DDIM-inverted noise + null-text
+optimization, not random noise. So the prompt should encode only what
+the inversion+null-text doesn't already capture (semantic content,
+identity, style — not geometry, layout, lighting, which are recovered
+by `z_T` and the optimized null-text embeddings).
+
+We approximate the gradient of "the prompt + null-text reconstruct
+the image under our pipeline" using a **CFG-aware Score Distillation
+Sampling (SDS)** surrogate (Poole et al. 2022 for SDS; classifier-free
+guidance for the conditioning structure):
+
+```
+t      ~ Uniform({1, ..., T})
+ε      ~ N(0, I)
+x_t    = √α_t · image_latent + √(1 - α_t) · ε
+
+ε_uncond = unet(x_t, t, null_text_embedding)
+ε_cond   = unet(x_t, t, prompt_embedding)
+ε_cfg    = ε_uncond + cfg_scale · (ε_cond − ε_uncond)
+
+L_sds    = MSE(ε_cfg, ε)
+```
+
+Two U-Net forward+backward passes per PEZ step (uncond + cond). The
+gradient on the soft prompt comes through `ε_cond`. When `null_text`
+already explains an image property (geometry, lighting), `ε_uncond`
+already gets that part right — the marginal gradient on the prompt
+for that property is small. The prompt's optimization is implicitly
+pushed toward content null-text doesn't capture.
+
+This is roughly **600× cheaper per gradient step than running the full
+50-step DDIM denoising chain** while still being pipeline-aware (the
+`null_text` input makes it reflect our actual inversion+null-text
++ denoising stack, not from-scratch generation).
 
 **Hyperparameters.**
-- `N` (prompt length): **prefer large N** (e.g., 12–20 for source
-  inversion) within the 77-token budget. Each additional token gives
-  PEZ room to encode another visual detail of the source — color,
-  texture, lighting, scale, breed, etc. — which propagates into PEZ-2
-  via the joint loss (see Section 3.2's detail-richness argument).
-  Lower N would make the source description sparser; we want
-  detail-richness as a feature.
-- `num_steps`: 1000–3000 depending on convergence behavior. Larger N
-  may need more steps.
-- `learning_rate`: per Wen et al.
+- `N` (prompt length): **prefer large N** (e.g., 12–20). Each
+  additional token gives PEZ room to encode another visual detail —
+  and the SDS-CFG loss specifically focuses gradient pressure on
+  details null-text doesn't already capture, so the token budget is
+  spent more efficiently than under vanilla PEZ.
+- `num_steps`: 1000–3000.
+- `cfg_scale`: 7.5 standard. Higher values give sharper SDS gradients
+  but risk DreamFusion-style over-saturation.
+- `timestep_sampling`: `uniform` (default) or `importance` (focus on
+  mid-timesteps where SDS signal is strongest).
+
+**Alternating optimization of prompt and null-text.** PEZ-1's SDS
+loss requires `null_text_embedding`, and null-text optimization
+requires a prompt — chicken-and-egg. We resolve it via a two-round
+alternating-optimization pipeline (block coordinate descent) that
+**naturally enforces the geometry-vs-semantics partition** without
+any new hyperparameters tuned per image:
+
+```
+# Round 0 — bootstrap from vanilla PEZ
+c_0 = vanilla_pez(image)                             # CLIP-only, no SD
+                                                      # ~1500 CLIP steps
+
+# Round 1 — null-text fills the gap, prompt refines
+z_T, traj = ddim_inversion(image, c_0)
+N_0       = null_text_optimization(traj, c_0)        # existing code
+                                                      # ~500 SD passes
+c_1       = sds_pez(image, N_0, warm_start=c_0)      # NEW: SDS-PEZ
+                                                      # with frozen N_0
+                                                      # ~1500 SD passes
+
+# Round 2 — re-balance partition
+N_1       = null_text_optimization(image, c_1)       # ~500 SD passes
+c_2       = sds_pez(image, N_1, warm_start=c_1)      # ~1500 SD passes
+                                                      # (or fewer for refinement)
+
+# Final outputs:
+prompt    = c_2
+null_text = N_1
+```
+
+**Why this enforces the geometry partition (priority 1).** Each step's
+natural bias aligns to push geometry into null-text and semantics into
+the prompt:
+
+- **Vanilla PEZ is biased toward semantic content.** It optimizes
+  CLIP-image cosine similarity. CLIP was trained on caption-image
+  pairs; the loss preferentially rewards semantic descriptors
+  (subject identity, attributes, style) over geometric specifications
+  (precise layout, lighting). The bootstrap prompt `c_0` therefore
+  leans semantic.
+- **Null-text optimization fills in the residual.** Given a
+  semantic-leaning prompt, the gap between predicted and actual noise
+  is concentrated on geometric/structural content. Null-text picks
+  that up.
+- **SDS-PEZ refinement (with frozen null-text)** further pushes the
+  prompt toward the semantic content null-text didn't already capture.
+
+After R=2 rounds, both `prompt` and `null_text` are at (approximately)
+a fixed point of the alternating optimization — each is optimal given
+the other.
+
+**Why this generalizes across inputs (priority 2).** No new
+hyperparameters introduced beyond what's published in vanilla PEZ
+(Wen et al. 2023) and null-text optimization (Mokady et al. 2022) and
+PEZ-1's SDS loss. All three sub-routines have settled defaults that
+work across image domains. The only knob R1 ablates is `R` itself
+(number of rounds), with `R=2` as the proposed baseline and `R∈{1, 3}`
+as cheap-to-run comparisons.
+
+**Cost.** Approximately 2× SDS-PEZ-alone, dominated by two
+null-text-optimization calls (~500 SD passes each) plus two SDS-PEZ
+calls (~1500 SD passes each). Total per source image: ~25-50 minutes
+on an A100. Each step is a known-working component, so failure modes
+are isolated and recoverable.
+
+**Geometry-partition diagnostic.** After PEZ-1 produces `(prompt,
+null_text)`, generate from null-text alone (CFG=1, no prompt) starting
+from `z_T`:
+
+```
+img_from_null = ddim_denoise(z_T, null_text, cfg=1.0)
+```
+
+Inspect the result:
+
+- *Partition working*: `img_from_null` shows the source's layout,
+  composition, lighting, and rough structure — but with generic /
+  wrong identity for the subject. (E.g., for a "black husky"
+  source, `img_from_null` shows a dog-shaped silhouette in the right
+  pose with the right lighting but a generic-looking dog.)
+- *Null-text collapse*: `img_from_null` faithfully reconstructs the
+  source including identity. Null-text has captured everything; the
+  prompt is doing nothing. R=2 should not produce this; if observed,
+  fall back to R=1 or investigate the SDS-PEZ refinement.
+- *Partition didn't form*: `img_from_null` looks unrelated to the
+  source. Null-text didn't capture image-specific content. Likely a
+  bug in null-text optimization or the bootstrap prompt was
+  pathological.
+
+Running this diagnostic on every test image during R1 development
+gives direct empirical confirmation of priority 1.
+
+**Why we don't use joint optimization with regularizers.** That
+alternative was considered and rejected because:
+
+1. **It doesn't structurally enforce the geometry partition.** Two
+   regularizers (`λ_N`, `λ_inform`) prevent collapse but don't
+   constrain *what kind of content* goes where. Null-text could drift
+   to encode discriminative semantic content within its budget; the
+   prompt could end up with geometric content. The partition would
+   emerge from optimization dynamics that depend on initialization
+   and hyperparameter geometry — neither a robust nor a generalizable
+   property.
+2. **Two new tunable hyperparameters per domain.** No published
+   priors. Sweeping `(λ_N, λ_inform)` per image takes hours.
+
+Joint optimization remains an interesting v2 exploration if
+alternating proves insufficient — see Section 8 Open Question 1.
 
 **Caching.** PEZ on a source image is expensive (~15–30 min on GPU,
 longer for large N). For research we cache outputs per image — once
@@ -403,37 +548,62 @@ prompt.
 similarity targets — the source image and the user's instruction text
 — producing a target prompt that satisfies both.
 
-**The loss.**
+**The loss.** Three terms with different roles. The source-preservation
+term mirrors PEZ-1's reconstruction-aware loss (CFG-aware SDS with
+null-text); the instruction-following term is text-text CLIP cosine;
+the warm-start anchor is L2 in soft-prompt space.
+
+**Null-text from PEZ-1, frozen.** PEZ-2 reuses the jointly-optimized
+null-text produced by PEZ-1's run on the same source image. Null-text
+is **frozen** during PEZ-2 (only the soft prompt is updated). This
+keeps the source-preservation term well-defined and ensures the
+SDS-CFG loss is comparable to what PEZ-1 saw — same conditioning
+regime, same approximation of the editing-time pipeline.
 
 ```python
-# Inputs (computed once before optimization, never updated):
-image_emb  = clip_image_encoder(source_image)        # [768] joint space
-instr_emb  = clip_text_encoder(instruction_text)     # [768] joint space
+# Inputs computed once before optimization:
+instr_emb  = clip_text_encoder(instruction_text)     # [768] for L_instr
+null_text  = pre_computed_null_text_embedding        # [1, 77, 768] for L_source
 
 # Optimization variable — the soft prompt:
 soft_prompt = init_from_pez1_tokens()                # [N, 768]  (warm start)
 
 # At each gradient step:
-prompt_emb = clip_text_encoder(soft_prompt)          # [768] joint space
+# L_source: SDS-CFG (same form as PEZ-1's loss)
+t        ~ Uniform({1, ..., T})
+ε        ~ N(0, I)
+x_t      = √α_t · image_latent + √(1 - α_t) · ε
+ε_uncond = unet(x_t, t, null_text)
+ε_cond   = unet(x_t, t, soft_prompt)
+ε_cfg    = ε_uncond + cfg_scale · (ε_cond − ε_uncond)
+L_source = MSE(ε_cfg, ε)
 
-L = -cos_sim(prompt_emb, image_emb)                  # source preservation
-    -λ * cos_sim(prompt_emb, instr_emb)              # instruction following
-    +γ * ||soft_prompt - soft_prompt_init||²         # warm-start anchor
+# L_instr: text-text CLIP cosine (the instruction is text, not image)
+prompt_pooled = clip_text_encoder(soft_prompt).pooled
+L_instr  = -cos_sim(prompt_pooled, instr_emb)
 
-# Backprop through CLIP text encoder; project to discrete vocab; repeat.
+# L_anchor: L2 in soft-prompt space
+L_anchor = ||soft_prompt - soft_prompt_init||²
+
+# Combined:
+L = L_source + λ · L_instr + γ · L_anchor
+
+# Backprop through CLIP/U-Net; project to discrete vocab; repeat.
 ```
 
 Three loss terms, three roles:
 
-1. **Source preservation** (`-cos_sim(prompt, image)`): keeps the
-   prompt anchored to describing the source image's content.
-2. **Instruction following** (`-λ · cos_sim(prompt, instruction)`):
-   pulls the prompt toward describing the desired post-edit outcome.
-3. **Warm-start anchor** (`+γ · ||soft − init||²`): keeps the soft
-   prompt close to PEZ-1's discrete tokens unless an instruction
-   pressure overrides it. This is what gives us the "minimal edit"
-   property — most positions stay at PEZ-1's tokens; only positions
-   under strong instruction pressure shift.
+1. **Source preservation** (`L_source`): SDS-CFG surrogate for
+   "prompt + null-text reconstruct the source image through our
+   pipeline." Same loss family as PEZ-1; same null-text used.
+2. **Instruction following** (`L_instr`): pulls the prompt toward
+   describing the desired post-edit outcome. The instruction is text;
+   text-text CLIP similarity is the appropriate signal.
+3. **Warm-start anchor** (`L_anchor`): keeps the soft prompt close
+   to PEZ-1's discrete tokens unless an instruction pressure overrides.
+   This is what gives us the "minimal edit" property — most positions
+   stay at PEZ-1's tokens; only positions under strong instruction
+   pressure shift.
 
 **Why this is not the same as classical instruction-following.**
 CLIP doesn't really understand instructions like
@@ -802,7 +972,12 @@ Metrics: PSNR / SSIM / LPIPS on `recon = decode(reconstruct(invert(image,
 prompt)))`. Plus footprint concentration of refined source tokens to
 verify ε bounds are doing what we expect.
 
-### 4.2 PEZ-2 target prompt quality (sub-claim 2)
+### 4.2 PEZ-2 target prompt quality (sub-claim 2) — Knob 1: divergence
+
+This evaluation measures **Knob 1**: how far PEZ-2's prompt diverges
+from PEZ-1, controlled by `(λ_instruction, γ_anchor)`. The sweep
+characterizes the operating range of Knob 1 independent of editing-
+time settings.
 
 For a fixed test set of 30 (source image, instruction) pairs covering
 substitution, addition, and attribute change, measure:
@@ -816,13 +991,22 @@ substitution, addition, and attribute change, measure:
   instruction?
 - **CLIP similarity** between PEZ-2's output and a hand-crafted
   ground-truth target prompt for each test case.
-- **(λ, γ) ablation**: sweep λ ∈ {0.5, 1.0, 2.0, 5.0} and
-  γ ∈ {0.01, 0.1, 1.0}. Report performance across the grid; identify
-  recommended operating points.
+- **(λ_instruction, γ_anchor) ablation**: sweep `λ_instruction ∈ {0.5,
+  1.0, 2.0, 5.0}` and `γ_anchor ∈ {0.01, 0.1, 1.0}`. Report
+  performance across the grid; identify recommended operating points.
 
-Expected finding: a (λ, γ) region exists where preservation is high
-AND edit correctness is high. The operating points should be
-relatively stable across edit types.
+Three reference Knob-1 operating points to use across downstream
+evaluations:
+
+| Setting | `λ_instruction` | `γ_anchor` | Expected behavior |
+|---|---|---|---|
+| Conservative | 0.5 | 1.0 | High preservation; instruction barely applied |
+| Moderate | 1.0 | 0.1 | Balanced; preservation high, edit visible in prompt |
+| Aggressive | 3.0 | 0.01 | Low preservation; large prompt drift toward instruction |
+
+Expected finding: the **moderate** point is the right Knob-1 default;
+conservative and aggressive bracket the failure modes (no edit vs.
+broken alignment).
 
 ### 4.3 P2P/PnP composability (sub-claim 3)
 
@@ -839,9 +1023,12 @@ preservation degrades with PEZ-2 vs. hand-crafted, the issue is
 PEZ-2 producing target prompts whose token structure doesn't align
 cleanly under LCS — investigate.
 
-### 4.4 End-to-end editing quality (sub-claim 4)
+### 4.4 End-to-end editing quality (sub-claim 4) — Knob 2: edit aggressiveness
 
-End-to-end editing quality with the full architecture vs. baselines.
+End-to-end editing quality with the full architecture vs. baselines,
+plus a sweep over **Knob 2** — `(cross_replace_steps, self_replace_steps)`
+— which controls how much P2P injects source attention vs. lets the
+target prompt drive rendering.
 
 **Test set.**
 
@@ -851,16 +1038,25 @@ End-to-end editing quality with the full architecture vs. baselines.
 
 **Configurations.**
 
-- **BLIP-2 caption + hand-crafted target + P2P/PnP**: human writes the
-  edit; tests the upper bound of caption-based editing. (Requires
-  human in the loop.)
-- **Continuous TI + P2P (broken baseline)**: inject vanilla continuous
-  textual inversion embeddings at target positions. Tests the
-  smearing-failure prediction from Section 1.
-- **InstructPix2Pix**: instruction-trained end-to-end editing model
-  (Brooks et al. 2023). Tests against state of the art for fully-
-  automated instruction-following editing.
-- **Proposed (PEZ-1 + PEZ-2 + P2P/PnP)**: the full pipeline.
+For each test pair, run the **proposed pipeline** with **moderate
+Knob 1** (`λ_instruction=1.0, γ_anchor=0.1`) under three Knob-2
+operating points:
+
+| Knob-2 setting | `cross_replace_steps` | `self_replace_steps` | Expected behavior |
+|---|---|---|---|
+| Subtle | 0.8 | 0.5 | Strong source preservation; edit may not render |
+| Moderate | 0.5 | 0.3 | Balanced — recommended default |
+| Loud | 0.3 | 0.1 | Weak source preservation; aggressive edit; structural risk |
+
+Plus the standard baseline configurations (run at the moderate
+Knob-2 setting only):
+
+- **BLIP-2 caption + hand-crafted target + P2P/PnP**: human-in-the-loop
+  ceiling for caption-based editing.
+- **Continuous TI + P2P (broken baseline)**: continuous textual
+  inversion injected at target positions.
+- **InstructPix2Pix** (Brooks et al. 2023): instruction-trained
+  end-to-end editing model.
 
 **Metrics.**
 
@@ -874,16 +1070,82 @@ End-to-end editing quality with the full architecture vs. baselines.
 
 **Hypothesis.**
 
-- Proposed method beats continuous TI + P2P decisively on additive
-  edits (continuous TI is expected to fail outright there).
+- Proposed method at moderate Knob-2 beats continuous TI + P2P
+  decisively on additive edits.
 - Proposed method matches or beats InstructPix2Pix on structure
-  preservation (P2P/PnP gives stronger structural promises than IP2P's
-  end-to-end editing). Concept fidelity should be comparable.
+  preservation. Concept fidelity should be comparable.
 - Proposed method approaches the BLIP-2 + hand-crafted ceiling on edit
-  quality, demonstrating that PEZ-2 successfully automates what humans
-  do when hand-crafting target prompts.
+  quality.
+- Knob 2 has predictable trade-offs: subtle → high structure
+  preservation but low concept fidelity; loud → high concept fidelity
+  but degraded structure preservation. Moderate sits at the elbow.
 
-### 4.5 Detail-richness advantage at large N
+### 4.5 Knob 1 × Knob 2 interaction grid
+
+The two control knobs identified above operate at different stages of
+the pipeline and are nominally independent, but interact in their
+effect on the final edit. This evaluation maps the joint operating
+space.
+
+**Why this is cheap.** Knob 1 lives at PEZ-2 optimization time
+(needs to re-run PEZ-2: ~10 min per setting). Knob 2 lives at editing
+time (just re-run the denoising loop: ~2 min per setting). For each
+PEZ-2 output, all Knob-2 settings can be evaluated for ~2 min × |Knob
+2| extra time — no re-optimization needed.
+
+**Sweep design.**
+
+For each of 5 representative (image, instruction) pairs in the test
+set, evaluate the 3 × 3 = 9 setting grid:
+
+```
+                     Knob 2 (edit aggressiveness)
+                     Subtle    Moderate    Loud
+Knob 1     Conservative   ⬜       ⬜         ⬜
+(divergence)  Moderate    ⬜       ⬜         ⬜
+              Aggressive  ⬜       ⬜         ⬜
+```
+
+**Cost per (image, instruction) pair:**
+- 3 PEZ-2 runs × ~10 min = ~30 min
+- 9 edits × ~2 min = ~18 min
+- Total: ~50 min per pair
+
+For 5 representative pairs: ~4 hours of GPU time. Scales linearly
+with the size of the representative set.
+
+**What to extract from the grid:**
+
+1. **Diagonal of coherence**: which (Knob 1, Knob 2) combinations
+   produce visually coherent edits — where the edit renders cleanly
+   AND the source structure is preserved.
+2. **Failure-mode quadrants**:
+   - High Knob 1 + low Knob 2 (aggressive prompt + subtle edit):
+     prompt encodes major change but P2P injection prevents
+     rendering. Result: subtle visible change despite major prompt
+     drift. Diagnostic that the editing mechanism is the bottleneck.
+   - Low Knob 1 + high Knob 2 (conservative prompt + loud edit):
+     prompt barely differs but editing is permissive. Result:
+     subtle change. Diagnostic that the prompt is the bottleneck.
+   - Both high: dramatic edit, high structural-breakdown risk.
+   - Both low: minimal edit, source preserved.
+3. **Generalizable defaults**: if the moderate × moderate cell is
+   the best across all 5 representative pairs, declare those as the
+   universal v1 defaults. If the optimal cell varies by edit type
+   (substitution vs. additive vs. style), document that and pick a
+   reasonable compromise.
+
+**Output for the writeup**: a 5 × 9 grid (5 image-instruction pairs ×
+9 settings) of edit results. Reading the grid empirically tells the
+reader where the proposed pipeline lives in (Knob 1, Knob 2) space
+and what the sensitivity profile looks like.
+
+This characterization is the project's contribution to the
+*operability* of attention-based editing: instead of "P2P just works"
+or "P2P doesn't," we provide a 2D map of the editing space with
+characterized regions.
+
+### 4.6 Detail-richness advantage at large N
 
 This validates the claim from Section 3.2's detail-richness subsection:
 PEZ-2 with large N produces target prompts containing visual details
@@ -920,7 +1182,7 @@ doesn't just match what a user could do — it can do better than
 naive user prompts because it has automatic access to all of the
 source image's visual properties via the CLIP source-similarity term.
 
-### 4.6 P2P alignment robustness on PEZ-derived prompts
+### 4.7 P2P alignment robustness on PEZ-derived prompts
 
 PEZ-1 and PEZ-2 may produce token sequences with unusual orderings.
 Verify that P2P's LCS alignment still produces sensible mappings:
@@ -1341,7 +1603,30 @@ by week 5, R4 by weeks 6-9.
 These should be addressed during the project; they are not blockers but
 they shape the methodology:
 
-1. **What instruction types does PEZ-2 handle well, and which fail?**
+1. **R=2 sufficiency and v2 alternatives to alternating.** The
+   v1 baseline uses alternating optimization with R=2 rounds (vanilla
+   PEZ → null-text → SDS-PEZ → null-text → SDS-PEZ). Open questions:
+
+   - **Is R=2 enough?** R1 should ablate R∈{1, 2, 3} on a small set
+     of test images. R=2 should produce a near-fixed-point
+     decomposition; R=3 tests whether further iteration helps. If
+     R=1 is sufficient (vanilla PEZ + null-text + frozen-null-text
+     SDS-PEZ), we save compute. If R=3 is needed, R1 catches it.
+   - **When does the geometry partition fail?** The diagnostic
+     described in Section 3.1 should pass for ≥90% of test images.
+     If it fails for specific image classes (e.g., highly-stylized
+     images, abstract content), document and investigate.
+   - **Joint optimization with regularizers (v2).** A cheaper
+     alternative is joint optimization of prompt and null-text with
+     `λ_N` and `λ_inform` regularizers. Trades reliability for
+     compute. Considered for v2 if R=2 alternating is unworkable due
+     to compute constraints or insufficient quality.
+   - **Curriculum CFG (v2).** Anneal cfg_scale from 1 (no null-text
+     needed) to the editing-time value (7.5) during PEZ-1 to give
+     the optimization a more stable trajectory. Schedule design is
+     non-trivial; deferred unless v1 alternating fails.
+
+2. **What instruction types does PEZ-2 handle well, and which fail?**
    CLIP encodes `"change the animal into a cat"` as dominantly "cat".
    But it handles negation and removal poorly. Characterize the
    instruction-type taxonomy empirically in R2: which instructions
@@ -1349,27 +1634,35 @@ they shape the methodology:
    substitution, addition, attribute change, style change. Likely
    weak: removal, negation, comparative ("make it bigger").
 
-2. **(λ, γ) operating range.** R2 ablates the joint loss
+3. **(λ, γ) operating range.** R2 ablates the joint loss
    coefficients. Open question: is there a single (λ, γ) that works
    across edit types, or do different edit types need different
    settings? If the latter, we'd need a way to detect edit type from
    the instruction — without an LLM, this might require user-supplied
    edit-type tags.
 
-3. **Multi-step instructions.** "Change the animal to a cat AND add a
+4. **Multi-step instructions.** "Change the animal to a cat AND add a
    bowtie" — encode as a single instruction (CLIP encoding handles
    both signals), or sequence as two PEZ-2 runs? Probably the latter
    for cleaner alignment, but worth comparing.
 
-4. **Vocabulary biasing during PEZ search.** Restricting PEZ's
+5. **Vocabulary biasing during PEZ search.** Restricting PEZ's
    vocabulary to common edit-friendly words might help PEZ-2 produce
    more sensible target prompts (since the warm start is more natural).
    Worth ablating.
 
-5. **Refinement budget allocation.** Two ε values to tune — one for
+6. **SDS stability.** DreamFusion-style SDS has known issues
+   (over-saturation, mode collapse, sensitivity to timestep sampling).
+   For PEZ — which optimizes a finite vocabulary projection of a soft
+   prompt rather than continuous pixels — these issues may manifest
+   differently. Worth measuring and possibly mitigating with VSD
+   (Variational Score Distillation, Wang et al. 2023) if vanilla
+   SDS proves unstable.
+
+7. **Refinement budget allocation.** Two ε values to tune — one for
    PEZ-1, one for PEZ-2. Should they be coupled, or independent?
 
-6. **Interaction with P+ / per-layer textual inversion.** P+ (Voynov
+8. **Interaction with P+ / per-layer textual inversion.** P+ (Voynov
    et al. 2023) shows per-layer embeddings capture concepts more
    richly. Could PEZ-1 / PEZ-2 extend to the per-layer setting? Likely
    yes but adaptation needed.

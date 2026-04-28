@@ -1,0 +1,58 @@
+# PEZ-1: source-image inversion to discrete CLIP-vocabulary prompt
+#
+# Used by: src/pez/source_inversion.py
+# Algorithm: Wen et al. 2023 "Hard Prompts Made Easy" (PEZ),
+#            adapted from external/pez/optim_utils.py
+# Loss: pluggable — see loss_type below.
+
+# ─── Loss formulation ────────────────────────────────────────────
+# "sds": CFG-aware score-distillation surrogate of "prompt + null-text
+#        reconstruct the image under our pipeline." Project default.
+#        Requires null_text_embedding to be passed at call time.
+# "clip": vanilla PEZ — prompt-image CLIP cosine similarity.
+#         Faster, single CLIP-text pass per step. Used as legacy /
+#         warm-start / fallback.
+loss_type: sds
+
+# Used only when loss_type == "sds":
+cfg_scale: 7.5                # classifier-free guidance scale
+                              # higher → sharper gradient, riskier
+                              # over-saturation (DreamFusion findings)
+
+timestep_sampling: uniform    # "uniform" or "importance" — focus on
+                              # mid-timesteps where SDS signal is
+                              # strongest. Implement uniform first.
+
+# ─── Prompt structure ────────────────────────────────────────────
+prompt_length: 15             # N tokens. Larger N → more detail
+                              # captured (see proposal §3.2 detail-
+                              # richness). Recommended 12-20.
+
+# ─── Optimization ────────────────────────────────────────────────
+num_steps: 1500               # PEZ optimization steps. More for
+                              # larger N or sds (vs clip).
+learning_rate: 0.1            # AdamW lr on the soft prompt
+weight_decay: 0.1
+batch_size: 1
+projection_every: 1           # project soft prompt to vocab every
+                              # k steps. 1 is standard PEZ.
+
+# ─── Models ──────────────────────────────────────────────────────
+clip_model: openai/clip-vit-large-patch14
+                              # Must match the CLIP variant used by SD
+
+# ─── Alternating-optimization rounds ─────────────────────────────
+# R from RESEARCH_PROPOSAL.md §3.1. R=2 is the v1 baseline; R=1 and
+# R=3 are cheap-to-run ablations.
+num_rounds: 2
+
+# ─── Caching ─────────────────────────────────────────────────────
+# Hash key includes config + image bytes + round index. Intermediate
+# (c_r, N_r) tuples are cached so resume-on-crash is cheap.
+cache_dir: cache/pez_source_prompts/
+use_cache: true
+
+# ─── Misc ────────────────────────────────────────────────────────
+seed: 42
+device: cuda
+dtype: float16

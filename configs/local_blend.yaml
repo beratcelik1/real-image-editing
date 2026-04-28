@@ -1,0 +1,20 @@
+# LocalBlend: spatial gating mechanism for additive edits
+#
+# Used by: attention_control/local_blend.py
+# Specification: docs/p2p_pnp/ (Appendix A in RESEARCH_PROPOSAL.md)
+
+enabled: true
+
+# Threshold above which a patch is "inside" the edit mask.
+# Applied after normalizing by mask.max().
+threshold: 0.3
+
+# Spatial side length at which the mask is computed before resampling.
+# Cross-attention maps come at multiple resolutions (8, 16, 32, 64
+# for SD2.1); we pick one canonical and resample on-the-fly to layers
+# at other resolutions.
+base_resolution: 16
+
+# Optional morphological dilation of the binary mask, in iterations.
+# Softens the mask boundary so the edit doesn't have hard edges.
+dilate_iters: 1

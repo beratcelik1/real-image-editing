@@ -1,0 +1,47 @@
+# PEZ-2: instruction-conditioned target prompt generation
+#
+# Used by: src/pez/instruction_conditioned.py
+# Three-term loss:
+#   L = L_source + lambda_instruction * L_instr + gamma_anchor * L_anchor
+# where L_source is the same loss family as PEZ-1 (controllable via
+# source_loss_type), L_instr is text-text CLIP cosine, and L_anchor
+# is L2 to the warm-start initialization.
+
+# ─── Source-preservation term (mirrors PEZ-1's loss) ─────────────
+# Should match PEZ-1's loss_type for consistency. Both being "sds"
+# is the project default.
+source_loss_type: sds         # "sds" or "clip"
+cfg_scale: 7.5                # only used when source_loss_type == "sds"
+timestep_sampling: uniform    # only used when source_loss_type == "sds"
+
+# ─── Instruction-following term (always text-text CLIP cosine) ───
+# The instruction is text, not an image — SDS doesn't apply. Always
+# CLIP-cosine on the instruction text encoding.
+lambda_instruction: 1.0       # too low → no edit; too high → drift
+                              # off source
+
+# ─── Warm-start anchor term ──────────────────────────────────────
+warm_start: true              # initialize from PEZ-1's vocab embeddings
+gamma_anchor: 0.1             # too low → P2P alignment breaks
+                              # too high → no edit happens
+
+# ─── Optimization ────────────────────────────────────────────────
+# PEZ-2 is faster than PEZ-1 because warm-starting refines a near-
+# correct solution.
+num_steps: 500
+learning_rate: 0.05           # lower than PEZ-1 since we're refining
+projection_every: 1
+
+# ─── Models ──────────────────────────────────────────────────────
+clip_model: openai/clip-vit-large-patch14
+
+# ─── Caching ─────────────────────────────────────────────────────
+# Hash key includes config + image + instruction + pez_1 token IDs +
+# null_text hash (when sds).
+cache_dir: cache/pez_target_prompts/
+use_cache: true
+
+# ─── Misc ────────────────────────────────────────────────────────
+seed: 42
+device: cuda
+dtype: float16
