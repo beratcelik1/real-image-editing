@@ -33,7 +33,11 @@ learning_rate: 0.05           # lower than PEZ-1 since we're refining
 projection_every: 1
 
 # ─── Models ──────────────────────────────────────────────────────
-clip_model: openai/clip-vit-large-patch14
+# See configs/pez_1.yaml for the dim-matching rule. PEZ-2 uses CLIP
+# only via the text-text instruction-similarity term (no image features
+# needed here), but for cache-key consistency keep this in sync with
+# pez_1.yaml's clip_model.
+clip_model: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
 
 # ─── Caching ─────────────────────────────────────────────────────
 # Hash key includes config + image + instruction + pez_1 token IDs +

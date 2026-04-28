@@ -38,8 +38,13 @@ projection_every: 1           # project soft prompt to vocab every
                               # k steps. 1 is standard PEZ.
 
 # ─── Models ──────────────────────────────────────────────────────
-clip_model: openai/clip-vit-large-patch14
-                              # Must match the CLIP variant used by SD
+# Must match SD's text-encoder dim or clip_similarity_loss errors on
+# the cosine dot product. SD2.1-base uses OpenCLIP-H/14 (1024-dim) →
+# laion/CLIP-ViT-H-14-laion2B-s32B-b79K. SD1.5 uses OpenAI CLIP-L/14
+# (768-dim) → openai/clip-vit-large-patch14. This field is used for
+# cache hashing only; the caller loads the model and supplies
+# clip_image_features + text_projection to pez_invert_source.
+clip_model: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
 
 # ─── Alternating-optimization rounds ─────────────────────────────
 # R from RESEARCH_PROPOSAL.md §3.1. R=2 is the v1 baseline; R=1 and
