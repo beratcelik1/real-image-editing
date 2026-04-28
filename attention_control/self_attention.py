@@ -135,11 +135,25 @@ class SelfAttentionController:
         self_replace_steps: float = 0.5,
         layer_indices: set[int] | None = None,
         store_maps: bool = False,
+        local_blend=None,
     ) -> None:
+        """
+        Parameters
+        ----------
+        local_blend : LocalBlend | None
+            Optional spatial-gating mechanism for additive edits, shared
+            with the cross-attention controller. When provided, the
+            self-attention replacement is gated spatially: outside the
+            mask the source's self-attention is copied to the target
+            (PnP behavior); inside the mask the target's self-attention
+            is preserved so new content has structural room.
+            See ``attention_control/local_blend.py``.
+        """
         self.num_steps = num_steps
         self.self_replace_steps = self_replace_steps
         self.layer_indices = layer_indices
         self.store_maps = store_maps
+        self.local_blend = local_blend
 
         self._cur_step: int = 0
         self._attention_store: dict[str, list[list[torch.Tensor]]] = {}
@@ -176,6 +190,11 @@ class SelfAttentionController:
             if self._step_buffer[key]:
                 self._attention_store[key].append(list(self._step_buffer[key]))
                 self._step_buffer[key] = []
+        if self.local_blend is not None:
+            # Idempotent: LocalBlend's step() is guarded against being
+            # called twice within the same denoising step (see its docs),
+            # so it's safe to call from both controllers.
+            self.local_blend.step()
         self._cur_step += 1
 
     def reset(self) -> None:
@@ -232,13 +251,32 @@ class SelfAttentionController:
 
         Batch layout: ``[source…, target…]``.  The source half is kept
         unchanged; the target half receives a copy of the source maps.
+
+        If a ``LocalBlend`` is attached, the replacement is gated
+        spatially: outside the mask the source's self-attention is
+        copied to the target (full PnP); inside the mask the target's
+        self-attention is preserved (new content has structural room).
         """
         half = attn.shape[0] // 2
         if half == 0:
             return attn
 
         source = attn[:half]
-        return torch.cat([source, source.clone()], dim=0)
+        target = attn[half:]
+
+        spatial = attn.shape[2]
+        mask_flat = None
+        if self.local_blend is not None:
+            mask_flat = self.local_blend.get_mask(spatial)
+
+        if mask_flat is None:
+            return torch.cat([source, source.clone()], dim=0)
+
+        # ``w == 0`` outside mask → use source (full PnP).
+        # ``w == 1`` inside mask → keep target (no inject).
+        w = mask_flat.view(1, 1, spatial, 1)
+        blended = (1 - w) * source + w * target
+        return torch.cat([source, blended], dim=0)
 
 
 # ---------------------------------------------------------------------------

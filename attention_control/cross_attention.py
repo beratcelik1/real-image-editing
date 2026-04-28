@@ -142,13 +142,27 @@ class CrossAttentionController:
         reweight_factors: dict[int, float] | None = None,
         reweight_steps: float = 1.0,
         layer_indices: set[int] | None = None,
+        local_blend=None,
     ) -> None:
+        """
+        Parameters
+        ----------
+        local_blend : LocalBlend | None
+            Optional spatial-gating mechanism for additive edits. When
+            provided, the controller (a) records cross-attention maps to
+            the local-blend's target token positions during ``__call__``
+            and (b) gates the word-swap injection by the resulting mask
+            in ``_word_swap``. When ``None`` (default), the controller
+            behaves identically to the original P2P implementation.
+            See ``attention_control/local_blend.py``.
+        """
         self.num_steps = num_steps
         self.cross_replace_steps = cross_replace_steps
         self.token_mapping = token_mapping
         self.reweight_factors = reweight_factors
         self.reweight_steps = reweight_steps
         self.layer_indices = layer_indices
+        self.local_blend = local_blend
 
         self._cur_step: int = 0
         self._attention_store: dict[str, list[list[torch.Tensor]]] = {}
@@ -185,6 +199,8 @@ class CrossAttentionController:
             if self._step_buffer[key]:
                 self._attention_store[key].append(list(self._step_buffer[key]))
                 self._step_buffer[key] = []
+        if self.local_blend is not None:
+            self.local_blend.step()
         self._cur_step += 1
 
     def reset(self) -> None:
@@ -222,6 +238,12 @@ class CrossAttentionController:
         key = f"{place_in_unet}_cross"
         self._step_buffer[key].append(attn_weights.detach().cpu())
 
+        # Record cross-attention for the local-blend mask (if present).
+        # Mask used at step t comes from cross-attention recorded at
+        # step t-1; LocalBlend handles the lag internally.
+        if self.local_blend is not None:
+            self.local_blend.record_cross_attention(attn_weights)
+
         # Check layer filter for editing.
         if self.layer_indices is not None and layer_idx not in self.layer_indices:
             return attn_weights
@@ -249,6 +271,12 @@ class CrossAttentionController:
 
         Batch layout: ``[source…, target…]`` — first half is source, second
         half is target.  Works for batch=2 (no CFG) and batch=4 (with CFG).
+
+        If a ``LocalBlend`` is attached, the swap is gated spatially:
+        outside the mask the source's attention column replaces the
+        target's (full P2P injection); inside the mask the target's
+        attention column is preserved (no injection, letting the new
+        content render).
         """
         half = attn.shape[0] // 2
         if half == 0:
@@ -257,9 +285,26 @@ class CrossAttentionController:
         source = attn[:half]
         target = attn[half:].clone()
 
+        # Optional spatial mask from LocalBlend (None at step 0, or always
+        # None when no LocalBlend is attached). Mask is shape ``[spatial]``
+        # in [0, 1] where 1 = "inside the edit region (don't inject)".
+        spatial = attn.shape[2]
+        mask_flat = None
+        if self.local_blend is not None:
+            mask_flat = self.local_blend.get_mask(spatial)
+
         for src_tok, tgt_tok in self.token_mapping.items():
             if src_tok < attn.shape[-1] and tgt_tok < attn.shape[-1]:
-                target[:, :, :, tgt_tok] = source[:, :, :, src_tok]
+                if mask_flat is None:
+                    target[:, :, :, tgt_tok] = source[:, :, :, src_tok]
+                else:
+                    # ``w == 0`` outside mask → use source (full inject).
+                    # ``w == 1`` inside mask → keep target (no inject).
+                    w = mask_flat.view(1, 1, spatial)
+                    target[:, :, :, tgt_tok] = (
+                        (1 - w) * source[:, :, :, src_tok]
+                        + w * target[:, :, :, tgt_tok]
+                    )
 
         return torch.cat([source, target], dim=0)
 

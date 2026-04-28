@@ -1,0 +1,178 @@
+"""YAML config loading utility.
+
+Each `configs/*.yaml` file is loaded into a typed dataclass so config
+errors surface at load time, not deep inside training loops. The
+config schemas mirror the YAML files; extending either requires
+editing both.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# Config schemas
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Pez1Config:
+    """PEZ-1 source-image inversion config (configs/pez_1.yaml).
+
+    See RESEARCH_PROPOSAL.md §3.1 for the alternating R=2 algorithm.
+    """
+
+    # Loss formulation
+    loss_type: str  # "sds" or "clip"
+    cfg_scale: float
+    timestep_sampling: str  # "uniform" or "importance"
+
+    # Prompt structure
+    prompt_length: int
+
+    # Optimization
+    num_steps: int
+    learning_rate: float
+    weight_decay: float
+    batch_size: int
+    projection_every: int
+
+    # Models
+    clip_model: str
+
+    # Alternating-optimization rounds
+    num_rounds: int
+
+    # Caching
+    cache_dir: str
+    use_cache: bool
+
+    # Misc
+    seed: int
+    device: str
+    dtype: str
+
+
+@dataclass
+class Pez2Config:
+    """PEZ-2 instruction-conditioned generation config (configs/pez_2.yaml).
+
+    See RESEARCH_PROPOSAL.md §3.2 for the three-term loss.
+    """
+
+    source_loss_type: str  # "sds" or "clip"; should match Pez1Config.loss_type
+    cfg_scale: float
+    timestep_sampling: str
+
+    lambda_instruction: float
+
+    warm_start: bool
+    gamma_anchor: float
+
+    num_steps: int
+    learning_rate: float
+    projection_every: int
+
+    clip_model: str
+
+    cache_dir: str
+    use_cache: bool
+
+    seed: int
+    device: str
+    dtype: str
+
+
+@dataclass
+class LocalBlendConfig:
+    """LocalBlend mask-gating config (configs/local_blend.yaml).
+
+    See docs/p2p_pnp/local_blend specification (or RESEARCH_PROPOSAL.md
+    Appendix A).
+    """
+
+    enabled: bool
+    threshold: float
+    base_resolution: int
+    dilate_iters: int
+
+
+@dataclass
+class DDIMConfig:
+    """Inner DDIM + null-text-optimization sub-config of EditConfig."""
+
+    num_steps: int
+    cfg_scale: float
+    null_text: dict  # {"enabled": bool, "opt_steps": int, "lr": float}
+
+
+@dataclass
+class CrossAttentionConfig:
+    """Inner cross-attention sub-config of EditConfig."""
+
+    cross_replace_steps: float
+    layer_indices: list | None
+
+
+@dataclass
+class SelfAttentionConfig:
+    """Inner self-attention sub-config of EditConfig."""
+
+    enabled: bool
+    self_replace_steps: float
+    layer_indices: list | None
+
+
+@dataclass
+class EditConfig:
+    """End-to-end editing pipeline config (configs/edit.yaml)."""
+
+    sd_model: str
+    ddim: DDIMConfig
+    cross_attention: CrossAttentionConfig
+    self_attention: SelfAttentionConfig
+    alignment_method: str  # "lcs" or "semantic"
+    device: str
+    dtype: str
+
+
+# ---------------------------------------------------------------------------
+# Loaders
+# ---------------------------------------------------------------------------
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_DIR = _REPO_ROOT / "configs"
+
+
+def _load_yaml(path: Path | str) -> dict[str, Any]:
+    path = Path(path)
+    if not path.is_absolute():
+        path = _CONFIG_DIR / path
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def load_pez_1(path: Path | str = "pez_1.yaml") -> Pez1Config:
+    return Pez1Config(**_load_yaml(path))
+
+
+def load_pez_2(path: Path | str = "pez_2.yaml") -> Pez2Config:
+    return Pez2Config(**_load_yaml(path))
+
+
+def load_local_blend(path: Path | str = "local_blend.yaml") -> LocalBlendConfig:
+    return LocalBlendConfig(**_load_yaml(path))
+
+
+def load_edit(path: Path | str = "edit.yaml") -> EditConfig:
+    raw = _load_yaml(path)
+    raw["ddim"] = DDIMConfig(**raw["ddim"])
+    raw["cross_attention"] = CrossAttentionConfig(**raw["cross_attention"])
+    raw["self_attention"] = SelfAttentionConfig(**raw["self_attention"])
+    return EditConfig(**raw)
