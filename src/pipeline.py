@@ -1,13 +1,16 @@
 """Main editing pipeline: inversion -> attention extraction -> editing.
 
-Two top-level entry points:
+Three top-level entry points:
 
 - ``invert_and_reconstruct``: legacy, used to verify DDIM inversion +
   null-text optimization on a source image with a manual prompt.
 - ``edit_image``: the project's end-to-end editing entry point. Chains
-  PEZ-1 (alternating R=2), PEZ-2 (instruction-conditioned), DDIM
-  inversion, and P2P/PnP attention-controlled denoising with optional
-  LocalBlend gating.
+  PEZ-1 (alternating R=2), PEZ-2 (instruction-conditioned), and
+  :func:`run_p2p_edit`.
+- ``run_p2p_edit``: the editing tail of ``edit_image``, decoupled so
+  callers with token IDs from any source (BLIP captions, hand-written
+  prompts, sweep scripts) can reuse the DDIM-invert + P2P + LocalBlend
+  wiring without re-running PEZ.
 """
 
 from __future__ import annotations
@@ -163,15 +166,11 @@ def edit_image(
     Pipeline (RESEARCH_PROPOSAL.md §3.7):
       1. PEZ-1 (alternating R=2) → (source_token_ids, null_text)
       2. PEZ-2 (instruction-conditioned) → target_token_ids
-      3. DDIM-invert source under source encoding → z_T
-      4. align_pez_prompts → mapping, unmapped_target_indices
-      5. Set up CrossAttentionController + LocalBlend.
-      6. Run editing denoising loop (source/target batch from z_T).
-      7. Decode → edited image.
+      3. :func:`run_p2p_edit` → DDIM invert + P2P + LocalBlend → edited image
 
     Knob 1 / Knob 2 ablation (see §4.5):
       pez_2_overrides   — Knob 1 (lambda_instruction, gamma_anchor)
-      edit_overrides    — Knob 2 (cross_replace_steps, self_replace_steps)
+      edit_overrides    — Knob 2 (cross_replace_steps)
     Both override values are flat dicts whose keys match Pez2Config /
     EditConfig fields. Sub-config keys use dotted paths, e.g.
     ``"cross_attention.cross_replace_steps"``.
@@ -214,7 +213,7 @@ def edit_image(
     image = load_image(image_path)
 
     # 3. PEZ-1: source-image inversion (alternating R=2)
-    print("[edit_image] Step 1/6: PEZ-1 source inversion")
+    print("[edit_image] Step 1/3: PEZ-1 source inversion")
     source_token_ids, null_text = pez_invert_source(
         image=image,
         config=pez_1_config,
@@ -224,7 +223,7 @@ def edit_image(
     )
 
     # 4. PEZ-2: instruction-conditioned target generation
-    print("[edit_image] Step 2/6: PEZ-2 instruction-conditioned generation")
+    print("[edit_image] Step 2/3: PEZ-2 instruction-conditioned generation")
     target_token_ids = pez_invert_with_instruction(
         image=image,
         instruction=instruction,
@@ -234,6 +233,77 @@ def edit_image(
         sd_components=sd_components,
     )
 
+    # 5. P2P + LocalBlend edit (extracted as a public function so callers
+    #    with token IDs from any source — BLIP captions, hand-written
+    #    prompts, alternative inversions — can reuse the same wiring).
+    print("[edit_image] Step 3/3: P2P + LocalBlend edit")
+    edited = run_p2p_edit(
+        image=image,
+        source_token_ids=source_token_ids,
+        target_token_ids=target_token_ids,
+        sd_components=sd_components,
+        edit_config=edit_config,
+        local_blend_config=local_blend_config,
+    )
+
+    # 6. Save
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(image_path).stem
+    out_path = out_dir / f"{stem}_edited.png"
+    edited.save(out_path)
+    print(f"[edit_image] Saved to {out_path}")
+    return edited
+
+
+def run_p2p_edit(
+    image: Image.Image,
+    source_token_ids: list[int],
+    target_token_ids: list[int],
+    sd_components: dict,
+    edit_config: EditConfig,
+    local_blend_config: LocalBlendConfig,
+) -> Image.Image:
+    """Run a P2P + LocalBlend edit on *image* given source/target token IDs.
+
+    This is the editing tail of :func:`edit_image`, decoupled so callers
+    that already have token IDs (BLIP captions, hand-written prompts,
+    alternative inversion methods, sweep scripts iterating over
+    pre-computed PEZ-2 results, etc.) can reuse it without re-running
+    PEZ-1 / PEZ-2.
+
+    Pipeline:
+      1. Decode token IDs to strings; encode through CLIP text encoder.
+      2. DDIM-invert the source under its prompt.
+      3. LCS-align source/target token positions.
+      4. Set up :class:`CrossAttentionController` + optional
+         :class:`LocalBlend`.
+      5. Run the editing denoising loop with a ``[source, target]`` batch.
+      6. Decode the target half and return.
+
+    Parameters
+    ----------
+    image
+        Source PIL image.
+    source_token_ids, target_token_ids
+        Discrete token IDs for the source/target prompts. Apply any
+        ``cross_replace_steps`` overrides via :func:`_apply_overrides_nested`
+        on ``edit_config`` *before* calling this function.
+    sd_components
+        Dict ``{"unet", "vae", "text_encoder", "tokenizer", "scheduler"}``.
+    edit_config
+        Loaded :class:`EditConfig` with any overrides already applied.
+    local_blend_config
+        Loaded :class:`LocalBlendConfig`. If ``.enabled`` is False or
+        there are no unmapped target positions, LocalBlend is skipped
+        and the controller behaves identically to the original P2P
+        paper.
+
+    Returns
+    -------
+    edited_image : PIL.Image.Image
+        The edited target image.
+    """
     tokenizer = sd_components["tokenizer"]
     text_encoder = sd_components["text_encoder"]
     unet = sd_components["unet"]
@@ -242,37 +312,27 @@ def edit_image(
     device = torch.device(edit_config.device)
     dtype = _str_to_dtype(edit_config.dtype)
 
-    # 5. Encode source/target prompts and DDIM-invert
-    print("[edit_image] Step 3/6: encoding prompts")
     source_str = tokenizer.decode(source_token_ids, skip_special_tokens=True)
     target_str = tokenizer.decode(target_token_ids, skip_special_tokens=True)
     source_emb = get_text_embeddings(source_str, tokenizer, text_encoder, device)
     target_emb = get_text_embeddings(target_str, tokenizer, text_encoder, device)
     uncond_emb = get_uncond_embeddings(tokenizer, text_encoder, device)
 
-    print("[edit_image] Step 4/6: DDIM inversion under source")
     image_latent = encode_image(image, vae, device).to(dtype=dtype)
     z_T, _ = ddim_inversion(
-        image_latent,
-        source_emb,
-        uncond_emb,
-        unet,
-        scheduler,
+        image_latent, source_emb, uncond_emb,
+        unet, scheduler,
         num_steps=edit_config.ddim.num_steps,
         cfg_scale=edit_config.ddim.cfg_scale,
     )
 
-    # 6. Token alignment for P2P
     full_source_ids = tokenizer.encode(source_str)
     full_target_ids = tokenizer.encode(target_str)
     mapping, unmapped_target = align_pez_prompts(
-        full_source_ids,
-        full_target_ids,
+        full_source_ids, full_target_ids,
         method=edit_config.alignment_method,
     )
 
-    # 7. Set up controllers
-    print("[edit_image] Step 5/6: P2P/PnP edit")
     local_blend = None
     if local_blend_config.enabled and unmapped_target:
         local_blend = LocalBlend(
@@ -282,21 +342,18 @@ def edit_image(
             dilate_iters=local_blend_config.dilate_iters,
         )
 
+    layer_indices = (
+        set(edit_config.cross_attention.layer_indices)
+        if edit_config.cross_attention.layer_indices else None
+    )
     cross_ctrl = CrossAttentionController(
         num_steps=edit_config.ddim.num_steps,
         cross_replace_steps=edit_config.cross_attention.cross_replace_steps,
         token_mapping=mapping,
-        layer_indices=(
-            set(edit_config.cross_attention.layer_indices)
-            if edit_config.cross_attention.layer_indices
-            else None
-        ),
+        layer_indices=layer_indices,
         local_blend=local_blend,
     )
     register_attention_control(unet, cross_ctrl)
-
-    # 8. Run editing denoising loop with [source, target] batch
-    print("[edit_image] Step 6/6: denoising")
     edited_latent = _run_editing_loop(
         z_T=z_T,
         source_emb=source_emb,
@@ -310,15 +367,7 @@ def edit_image(
     )
     unregister_attention_control(unet)
 
-    # 9. Decode and save
-    edited = decode_latent(edited_latent[1:2], vae)  # target half of batch
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path(image_path).stem
-    out_path = out_dir / f"{stem}_edited.png"
-    edited.save(out_path)
-    print(f"[edit_image] Saved to {out_path}")
-    return edited
+    return decode_latent(edited_latent[1:2], vae)
 
 
 # ---------------------------------------------------------------------------
