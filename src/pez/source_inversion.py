@@ -1,0 +1,309 @@
+"""PEZ-1 source-image inversion via alternating R=2 optimization.
+
+See RESEARCH_PROPOSAL.md §3.1 for the algorithm. This module wires
+together vanilla PEZ (CLIP loss bootstrap), null-text optimization
+(existing in ``src/inversion.py``), and SDS-CFG-PEZ refinement
+(``src/pez/losses.py:sds_cfg_loss``) into a single function.
+
+Caching: per-image hash plus per-round results, so partial progress
+survives crashes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+from src.config import Pez1Config
+from src.inversion import ddim_inversion, null_text_optimization
+from src.pez.losses import clip_similarity_loss, sds_cfg_loss
+from src.pez.search import pez_search
+from src.utils import encode_image, get_uncond_embeddings, load_sd_components
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
+    """Hash key for caching: image bytes + relevant config fields."""
+    h = hashlib.sha256()
+    h.update(image.tobytes())
+    h.update(image.size[0].to_bytes(4, "little"))
+    h.update(image.size[1].to_bytes(4, "little"))
+    # Hash the config fields that affect the result.
+    config_str = (
+        f"{config.loss_type}|cfg={config.cfg_scale}|"
+        f"N={config.prompt_length}|steps={config.num_steps}|"
+        f"R={config.num_rounds}|seed={config.seed}|"
+        f"clip={config.clip_model}"
+    )
+    h.update(config_str.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _cache_path(image_hash: str, config: Pez1Config) -> Path:
+    return Path(config.cache_dir) / f"{image_hash}.pt"
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def pez_invert_source(
+    image: Image.Image,
+    config: Pez1Config,
+    sd_components: dict | None = None,
+    clip_image_features: torch.Tensor | None = None,
+    text_projection: torch.nn.Linear | None = None,
+) -> tuple[list[int], list[torch.Tensor]]:
+    """Run PEZ-1 alternating R=N pipeline on a source image.
+
+    Returns
+    -------
+    prompt_token_ids : list[int]
+        Final discrete CLIP-vocabulary token IDs (length config.prompt_length).
+    null_text_per_timestep : list[Tensor]
+        Optimized null-text embeddings, one per denoising timestep,
+        each shape ``[1, 77, 768]``. To be used at editing time and
+        reused as input to PEZ-2.
+
+    Parameters
+    ----------
+    image
+        Source PIL image.
+    config
+        Loaded ``Pez1Config`` (typically ``load_pez_1()``).
+    sd_components
+        Optional pre-loaded SD components dict
+        ``{"unet", "vae", "text_encoder", "tokenizer", "scheduler"}``.
+        If None, calls ``load_sd_components()`` internally.
+    clip_image_features
+        Optional pre-computed CLIP image embedding ``[1, D]`` for the
+        bootstrap clip_similarity_loss. If None, will need to be supplied
+        externally — vanilla PEZ requires a CLIP image-text similarity
+        target. (We don't load a CLIP model here to avoid a heavy
+        dependency; the caller is responsible.)
+
+        See docs/pez_conditional/DESIGN_CHOICES.md for the rationale.
+    text_projection
+        Optional ``CLIPModel.text_projection`` for the joint-space
+        comparison. If None, comparison is in the text encoder's
+        native output space.
+    """
+    # 1. Cache check
+    image_hash = _hash_image_and_config(image, config)
+    cache_file = _cache_path(image_hash, config)
+    if config.use_cache and cache_file.exists():
+        cached = torch.load(cache_file, map_location="cpu")
+        return cached["prompt_token_ids"], cached["null_text"]
+
+    # 2. Set up models
+    if sd_components is None:
+        sd_components = _load_sd_components_dict(config)
+    device = torch.device(config.device)
+    dtype = _str_to_dtype(config.dtype)
+    unet = sd_components["unet"]
+    vae = sd_components["vae"]
+    text_encoder = sd_components["text_encoder"]
+    tokenizer = sd_components["tokenizer"]
+    scheduler = sd_components["scheduler"]
+    token_embedding = text_encoder.text_model.embeddings.token_embedding
+
+    # 3. Encode the image to its VAE latent (used in SDS loss)
+    image_latent = encode_image(image, vae, device).to(dtype=dtype)
+
+    # 4. Round 0 — vanilla PEZ bootstrap (CLIP-cosine loss)
+    if clip_image_features is None:
+        raise ValueError(
+            "pez_invert_source requires `clip_image_features` for the "
+            "vanilla-PEZ bootstrap step. Compute the CLIP image embedding "
+            "of the source image externally and pass it in. "
+            "See docs/pez_conditional/DESIGN_CHOICES.md for why."
+        )
+
+    def _clip_loss_fn(projected: torch.Tensor) -> torch.Tensor:
+        return clip_similarity_loss(
+            projected,
+            target_image_features=clip_image_features,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            text_projection=text_projection,
+        )
+
+    print("[PEZ-1 Round 0] vanilla PEZ bootstrap (CLIP-cosine loss)")
+    c, soft_prompt = pez_search(
+        loss_fn=_clip_loss_fn,
+        token_embedding=token_embedding,
+        prompt_length=config.prompt_length,
+        num_steps=config.num_steps,
+        learning_rate=config.learning_rate,
+        weight_decay=config.weight_decay,
+        seed=config.seed,
+        device=device,
+        initial_soft_prompt=None,
+        projection_every=config.projection_every,
+    )
+
+    # 5. Round 1..R — alternating null-text + SDS-PEZ refinement
+    null_text: list[torch.Tensor] | None = None
+    for round_idx in range(1, config.num_rounds + 1):
+        print(f"[PEZ-1 Round {round_idx}] null-text + SDS-PEZ refinement")
+
+        # 5a. DDIM-invert under the current best prompt to get the
+        # latent trajectory needed by null-text optimization.
+        prompt_str = tokenizer.decode(c, skip_special_tokens=True)
+        text_emb = _encode_text(prompt_str, tokenizer, text_encoder, device)
+        uncond_emb = get_uncond_embeddings(tokenizer, text_encoder, device)
+
+        _, latents_traj = ddim_inversion(
+            image_latent,
+            text_emb,
+            uncond_emb,
+            unet,
+            scheduler,
+            num_steps=50,                 # standard
+            cfg_scale=config.cfg_scale,
+        )
+
+        # 5b. Null-text optimization with the existing implementation.
+        null_text = null_text_optimization(
+            latents_traj,
+            text_emb,
+            uncond_emb,
+            unet,
+            scheduler,
+            num_steps=50,
+            cfg_scale=config.cfg_scale,
+            opt_steps=10,
+            lr=1e-2,
+        )
+
+        # 5c. SDS-PEZ refinement with frozen null-text.
+        # Use a single representative null-text embedding for the SDS
+        # forward pass — the t-sampling chooses a random timestep, so
+        # we look up null_text[t] inside the loss.
+        null_text_stacked = torch.stack(null_text, dim=0)  # [T, 1, 77, D]
+
+        def _sds_loss_fn(projected: torch.Tensor) -> torch.Tensor:
+            # Sample t inside the loss so we pick the matching null-text.
+            return _sds_loss_with_t_sampled_null_text(
+                projected,
+                image_latent=image_latent,
+                null_text_per_timestep=null_text_stacked,
+                cfg_scale=config.cfg_scale,
+                unet=unet,
+                scheduler=scheduler,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer,
+                timestep_sampling=config.timestep_sampling,
+            )
+
+        c, soft_prompt = pez_search(
+            loss_fn=_sds_loss_fn,
+            token_embedding=token_embedding,
+            prompt_length=config.prompt_length,
+            num_steps=config.num_steps,
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay,
+            seed=config.seed + round_idx,
+            device=device,
+            initial_soft_prompt=soft_prompt.unsqueeze(0)
+                if soft_prompt.ndim == 2 else soft_prompt,
+            projection_every=config.projection_every,
+        )
+
+    # 6. Cache and return
+    if config.use_cache:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"prompt_token_ids": c, "null_text": null_text},
+            cache_file,
+        )
+
+    return c, null_text
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _str_to_dtype(s: str) -> torch.dtype:
+    return {"float16": torch.float16, "float32": torch.float32}[s]
+
+
+def _load_sd_components_dict(config: Pez1Config) -> dict:
+    """Wrap ``src.utils.load_sd_components`` in a dict by name."""
+    device = torch.device(config.device)
+    unet, vae, text_encoder, tokenizer, scheduler = load_sd_components(device)
+    return {
+        "unet": unet,
+        "vae": vae,
+        "text_encoder": text_encoder,
+        "tokenizer": tokenizer,
+        "scheduler": scheduler,
+    }
+
+
+def _encode_text(prompt: str, tokenizer, text_encoder, device) -> torch.Tensor:
+    """Wrapper around CLIP text encoder for a string prompt."""
+    tokens = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        return text_encoder(tokens.input_ids.to(device))[0]
+
+
+def _sds_loss_with_t_sampled_null_text(
+    projected: torch.Tensor,
+    image_latent: torch.Tensor,
+    null_text_per_timestep: torch.Tensor,    # [T, 1, 77, D]
+    cfg_scale: float,
+    unet,
+    scheduler,
+    text_encoder,
+    tokenizer,
+    timestep_sampling: str,
+) -> torch.Tensor:
+    """SDS loss variant that picks the matching null-text for the
+    sampled timestep, since null-text is per-timestep.
+
+    Implementation note: ``sds_cfg_loss`` from ``losses.py`` takes a
+    single null-text embedding. Here we sample t first, look up the
+    matching null-text, and call sds_cfg_loss with that single embedding.
+    """
+    device = image_latent.device
+    num_train_timesteps = scheduler.config.num_train_timesteps
+    T = null_text_per_timestep.shape[0]
+
+    # Sample t but constrain to indices we have null-text for.
+    if timestep_sampling == "uniform":
+        t_idx = torch.randint(0, T, (1,), device=device, dtype=torch.long)
+    else:  # "importance"
+        u = torch.rand(1, device=device)
+        t_idx = ((1 - torch.sqrt(1 - u)) * T).long().clamp_(0, T - 1)
+
+    null_text_for_t = null_text_per_timestep[t_idx.item()]  # [1, 77, D]
+
+    return sds_cfg_loss(
+        projected,
+        image_latent=image_latent,
+        null_text_embedding=null_text_for_t,
+        cfg_scale=cfg_scale,
+        unet=unet,
+        scheduler=scheduler,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        timestep_sampling=timestep_sampling,
+    )
