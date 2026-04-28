@@ -120,22 +120,16 @@ class CrossAttentionConfig:
 
 
 @dataclass
-class SelfAttentionConfig:
-    """Inner self-attention sub-config of EditConfig."""
-
-    enabled: bool
-    self_replace_steps: float
-    layer_indices: list | None
-
-
-@dataclass
 class EditConfig:
-    """End-to-end editing pipeline config (configs/edit.yaml)."""
+    """End-to-end editing pipeline config (configs/edit.yaml).
+
+    P2P-only by design (PnP self-attention injection was scoped out;
+    see RESEARCH_PROPOSAL.md and docs/p2p_pnp/REFERENCES.md).
+    """
 
     sd_model: str
     ddim: DDIMConfig
     cross_attention: CrossAttentionConfig
-    self_attention: SelfAttentionConfig
     alignment_method: str  # "lcs" or "semantic"
     device: str
     dtype: str
@@ -174,5 +168,4 @@ def load_edit(path: Path | str = "edit.yaml") -> EditConfig:
     raw = _load_yaml(path)
     raw["ddim"] = DDIMConfig(**raw["ddim"])
     raw["cross_attention"] = CrossAttentionConfig(**raw["cross_attention"])
-    raw["self_attention"] = SelfAttentionConfig(**raw["self_attention"])
     return EditConfig(**raw)

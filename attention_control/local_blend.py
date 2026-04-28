@@ -1,19 +1,17 @@
-"""LocalBlend — spatial gating for attention injection during P2P/PnP edits.
+"""LocalBlend — spatial gating for cross-attention injection during P2P edits.
 
-A shared mask state that both ``CrossAttentionController`` and
-``SelfAttentionController`` consult to decide where to inject
-(structural preservation, outside the mask) vs. where to leave the
-target alone (new content, inside the mask).
+A mask state that ``CrossAttentionController`` consults to decide
+where to inject (structural preservation, outside the mask) vs.
+where to leave the target alone (new content, inside the mask).
 
 The mask used at denoising step ``t`` is computed from cross-attention
-maps recorded at step ``t-1`` (one-step lag, since cross-attention
-layers run AFTER self-attention within each transformer block — the
-controller can't both record and consume cross-attention at the same
-step). The first denoising step has no mask; injection is unmasked.
+maps recorded at step ``t-1`` (one-step lag — within a denoising
+step, cross-attention is recorded but the mask used by the same step's
+injection comes from the previous step). The first denoising step has
+no mask; injection is unmasked at step 0.
 
-Specification: RESEARCH_PROPOSAL.md Appendix A and
-docs/p2p_pnp/local_blend.md (when written) and the design choice in
-docs/p2p_pnp/DESIGN_CHOICES.md #1.
+Specification: RESEARCH_PROPOSAL.md Appendix A and the design choice
+in docs/p2p_pnp/DESIGN_CHOICES.md #1.
 """
 
 from __future__ import annotations
@@ -25,16 +23,13 @@ import torch.nn.functional as F
 
 
 class LocalBlend:
-    """Shared mask state for P2P + PnP injection gating.
+    """Mask state for P2P cross-attention gating.
 
-    Attached to a controller via the ``local_blend`` parameter of
-    ``CrossAttentionController.__init__`` /
-    ``SelfAttentionController.__init__``. The cross-attention controller
-    feeds this object via ``record_cross_attention`` during its
-    ``__call__``; the self-attention controller queries this object via
-    ``get_mask`` during its ``_inject``. Both controllers call
-    ``step()`` from their own ``step()``; ``step()`` is idempotent
-    within a single denoising step.
+    Attached to ``CrossAttentionController`` via its ``local_blend``
+    parameter. The controller feeds this object via
+    ``record_cross_attention`` during its ``__call__`` and consults
+    ``get_mask`` in ``_word_swap``; ``step()`` is called from the
+    controller's ``step()`` to advance per-denoising-step state.
 
     Parameters
     ----------
@@ -194,9 +189,11 @@ class LocalBlend:
         store it as the mask to use for the NEXT step, and reset the
         accumulator.
 
-        Idempotent within a single denoising step: ``CrossAttentionController.step``
-        and ``SelfAttentionController.step`` both call this; only the
-        first call per step actually finalizes.
+        Idempotent: callable multiple times within a single denoising
+        step (only the first call finalizes). Reserved for the case
+        where multiple controllers all call this; in the P2P-only
+        configuration, ``CrossAttentionController.step`` is the only
+        caller.
         """
         if self._cur_step == self._finalized_step_id:
             return  # Already finalized for this step

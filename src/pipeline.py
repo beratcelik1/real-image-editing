@@ -47,10 +47,6 @@ from attention_control.cross_attention import (
     register_attention_control,
     unregister_attention_control,
 )
-from attention_control.self_attention import (
-    SelfAttentionController,
-    register_combined_control,
-)
 from attention_control.local_blend import LocalBlend
 
 
@@ -169,8 +165,7 @@ def edit_image(
       2. PEZ-2 (instruction-conditioned) → target_token_ids
       3. DDIM-invert source under source encoding → z_T
       4. align_pez_prompts → mapping, unmapped_target_indices
-      5. Set up CrossAttentionController, SelfAttentionController,
-         LocalBlend; combined into one attention processor.
+      5. Set up CrossAttentionController + LocalBlend.
       6. Run editing denoising loop (source/target batch from z_T).
       7. Decode → edited image.
 
@@ -298,20 +293,7 @@ def edit_image(
         ),
         local_blend=local_blend,
     )
-    if edit_config.self_attention.enabled:
-        self_ctrl = SelfAttentionController(
-            num_steps=edit_config.ddim.num_steps,
-            self_replace_steps=edit_config.self_attention.self_replace_steps,
-            layer_indices=(
-                set(edit_config.self_attention.layer_indices)
-                if edit_config.self_attention.layer_indices
-                else None
-            ),
-            local_blend=local_blend,
-        )
-        register_combined_control(unet, cross_ctrl, self_ctrl)
-    else:
-        register_attention_control(unet, cross_ctrl)
+    register_attention_control(unet, cross_ctrl)
 
     # 8. Run editing denoising loop with [source, target] batch
     print("[edit_image] Step 6/6: denoising")
@@ -323,7 +305,6 @@ def edit_image(
         unet=unet,
         scheduler=scheduler,
         cross_ctrl=cross_ctrl,
-        self_ctrl=self_ctrl if edit_config.self_attention.enabled else None,
         cfg_scale=edit_config.ddim.cfg_scale,
         num_steps=edit_config.ddim.num_steps,
     )
@@ -353,7 +334,6 @@ def _run_editing_loop(
     unet,
     scheduler,
     cross_ctrl,
-    self_ctrl,
     cfg_scale: float,
     num_steps: int,
 ) -> torch.Tensor:
@@ -361,7 +341,8 @@ def _run_editing_loop(
 
     Implements the core P2P loop: at each step run U-Net under
     (uncond, source, uncond, target) batch with CFG, then advance the
-    controllers' step counters.
+    cross-attention controller's step counter (which also advances any
+    attached LocalBlend).
     """
     scheduler.set_timesteps(num_steps)
     # Stack into batch [source, target]
@@ -381,10 +362,9 @@ def _run_editing_loop(
         eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
         latent = scheduler.step(eps, t, latent).prev_sample
 
-        # Advance controllers
+        # Advance the cross-attention controller (which also calls
+        # local_blend.step() if attached).
         cross_ctrl.step()
-        if self_ctrl is not None:
-            self_ctrl.step()
 
     return latent  # [2, 4, H, W] — index 0=source, 1=target
 

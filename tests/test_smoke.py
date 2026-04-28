@@ -54,7 +54,7 @@ def test_no_torch_config_loading():
     ed = load_edit()
     assert ed.sd_model
     assert 0 < ed.cross_attention.cross_replace_steps <= 1
-    assert 0 < ed.self_attention.self_replace_steps <= 1
+    assert ed.alignment_method in {"lcs", "semantic"}
 
 
 def test_no_torch_align_identity():

@@ -1,3 +1,6 @@
 [submodule "external/pez"]
 	path = external/pez
 	url = https://github.com/YuxinWenRick/hard-prompts-made-easy.git
+[submodule "external/prompt-to-prompt"]
+	path = external/prompt-to-prompt
+	url = https://github.com/google/prompt-to-prompt.git
