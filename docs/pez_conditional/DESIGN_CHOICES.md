@@ -144,3 +144,26 @@ caller to load once and pass it in makes the cost amortization
 explicit. The end-to-end `edit_image` (commit 4) handles this.
 
 ---
+
+## 7. LCS logic inlined in `src/splice/align.py`
+
+`align_pez_prompts` originally imported `compute_token_mapping` from
+`attention_control/cross_attention.py`, which transitively imports
+torch. This made `src/splice/align.py` impossible to import without
+torch installed — blocking environments where we just want to run
+the alignment logic in unit tests.
+
+**Decision (commit 4):** inline a copy of the LCS logic
+(`_compute_token_mapping_lcs`) directly in `src/splice/align.py`.
+The function is 5 lines and uses only `difflib` from the standard
+library. The original `compute_token_mapping` in
+`attention_control/cross_attention.py` is unmodified for backward
+compatibility with existing notebooks and code.
+
+This is a deliberate tiny duplication: the LCS algorithm is simple
+enough that maintaining two copies isn't a meaningful burden, and
+the dependency-decoupling benefit (torch-free unit tests) outweighs
+the duplication cost. Recorded explicitly so a future agent doesn't
+"deduplicate" by re-introducing the cross-module import.
+
+---

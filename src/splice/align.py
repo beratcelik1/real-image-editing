@@ -1,9 +1,13 @@
 """Token-alignment between PEZ-1 source and PEZ-2 target prompts.
 
-`align_pez_prompts` is the wrapper around the existing LCS alignment
-in `attention_control.cross_attention.compute_token_mapping` that also
-returns the unmapped target positions — the input `LocalBlend` needs
-to build its mask.
+`align_pez_prompts` returns both the LCS mapping (compatible with
+``CrossAttentionController.token_mapping``) and the unmapped target
+positions — the latter is what ``LocalBlend`` needs as its
+``target_token_indices``.
+
+The LCS logic mirrors the algorithm in
+``attention_control/cross_attention.py:compute_token_mapping`` but is
+inlined here so this module can be imported without pulling in torch.
 
 Semantic alignment (a CLIP-embedding-based fallback for cases where LCS
 is unreliable on PEZ-derived prompts) is documented in Appendix B of
@@ -12,9 +16,24 @@ the research proposal but not implemented here; LCS is the v1 default.
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 from typing import Literal
 
-from attention_control.cross_attention import compute_token_mapping
+
+def _compute_token_mapping_lcs(
+    source_ids: list[int],
+    target_ids: list[int],
+) -> dict[int, int]:
+    """Mirror of ``attention_control.cross_attention.compute_token_mapping``.
+
+    Inlined so this module is torch-free.
+    """
+    matcher = SequenceMatcher(None, source_ids, target_ids, autojunk=False)
+    mapping: dict[int, int] = {}
+    for block in matcher.get_matching_blocks():
+        for i in range(block.size):
+            mapping[block.a + i] = block.b + i
+    return mapping
 
 
 def align_pez_prompts(
@@ -54,7 +73,7 @@ def align_pez_prompts(
             "fall back to method='lcs'."
         )
 
-    mapping = compute_token_mapping(source_token_ids, target_token_ids)
+    mapping = _compute_token_mapping_lcs(source_token_ids, target_token_ids)
     mapped_target = set(mapping.values())
     unmapped_target_indices = [
         i for i in range(len(target_token_ids)) if i not in mapped_target
