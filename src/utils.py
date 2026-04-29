@@ -29,19 +29,32 @@ def _patch_hf_chat_template_404() -> None:
 
     Idempotent; safe to call multiple times.
     """
-    # Layer 0 (most reliable): replace transformers.utils.hub.list_repo_templates
-    # with a function that returns []. This is the function CLIPTokenizer's
-    # from_pretrained calls; intercepting here bypasses the entire HF
-    # network call chain for the chat-template lookup.
-    try:
-        import transformers.utils.hub as _t_hub
-        if not getattr(_t_hub, "_chat_template_404_patched", False):
-            def _no_chat_templates(*args, **kwargs):
-                return []
-            _t_hub.list_repo_templates = _no_chat_templates
-            _t_hub._chat_template_404_patched = True
-    except ImportError:
-        pass  # transformers not installed; nothing to patch
+    # Layer 0 (most reliable): replace `list_repo_templates` with a
+    # function that returns []. CLIP tokenizers genuinely have no chat
+    # templates, so [] is the correct return value.
+    #
+    # Critical detail: must patch in BOTH locations because
+    # tokenization_utils_base.py imports it via `from .utils.hub import
+    # list_repo_templates` at *its* module-import time, binding a local
+    # name. Patching only utils.hub.list_repo_templates leaves
+    # tokenization_utils_base.list_repo_templates as the original
+    # function — which is what from_pretrained actually calls.
+    def _no_chat_templates(*args, **kwargs):
+        return []
+
+    for module_path in (
+        "transformers.utils.hub",
+        "transformers.tokenization_utils_base",
+    ):
+        try:
+            import importlib
+            mod = importlib.import_module(module_path)
+            if not getattr(mod, "_chat_template_404_patched", False):
+                if hasattr(mod, "list_repo_templates"):
+                    mod.list_repo_templates = _no_chat_templates
+                mod._chat_template_404_patched = True
+        except ImportError:
+            pass  # transformers not installed; nothing to patch
 
     # Layer 1: patch huggingface_hub.hf_api.HfApi.list_repo_tree —
     # in case anything else calls it for additional_chat_templates.
