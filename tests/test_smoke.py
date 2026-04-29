@@ -43,6 +43,8 @@ def test_no_torch_config_loading():
     assert p1.num_rounds >= 1
     # projection_every removed in v1; should not be present
     assert not hasattr(p1, "projection_every")
+    # Residual parameterization for SDS rounds (proposal §3.1).
+    assert p1.delta_weight_decay >= 0.0
 
     p2 = load_pez_2()
     assert p2.lambda_instruction >= 0
@@ -251,6 +253,110 @@ def test_torch_local_blend_get_mask_step0_returns_none():
 
     lb = LocalBlend(target_token_indices=[5])
     assert lb.get_mask(spatial=256) is None
+
+
+@pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")
+def test_torch_pez_search_residual_anchor_holds_at_anchor():
+    """anchor_to + zero-gradient loss → soft prompt stays at anchor.
+
+    The residual parameterization claim: at Δ = 0 the pipeline
+    reproduces classic-PEZ-on-anchor exactly. With a constant loss
+    (zero gradient), Δ stays at 0 and the returned soft prompt equals
+    anchor_to. weight_decay also keeps Δ at 0 since 0 decays to 0.
+    """
+    import torch
+    from torch import nn
+
+    from src.pez.search import pez_search
+
+    vocab_size, dim = 100, 64
+    emb = nn.Embedding(vocab_size, dim)
+    anchor = torch.randn(1, 4, dim)
+
+    def constant_loss(soft):
+        # Use sum to keep the graph alive; .sum() of detached anchor is 0
+        return (soft - soft.detach()).sum()
+
+    out = pez_search(
+        loss_fn=constant_loss,
+        token_embedding=emb,
+        prompt_length=4,
+        num_steps=10,
+        learning_rate=0.1,
+        weight_decay=0.1,
+        seed=42,
+        device=torch.device("cpu"),
+        anchor_to=anchor,
+    )
+    # Δ should be exactly 0 → out == anchor (modulo dtype)
+    assert torch.allclose(out, anchor.to(out.dtype), atol=1e-6)
+
+
+@pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")
+def test_torch_pez_search_residual_anchor_pulls_delta_to_zero():
+    """anchor_to + persistent gradient → equilibrium at Δ = g/λ.
+
+    Verifies the OU stationary behavior at a coarse level: with a
+    persistent gradient pulling Δ in one direction and weight decay
+    pulling it back, the result is bounded (doesn't blow up over many
+    steps).
+    """
+    import torch
+    from torch import nn
+
+    from src.pez.search import pez_search
+
+    vocab_size, dim = 100, 64
+    emb = nn.Embedding(vocab_size, dim)
+    anchor = torch.zeros(1, 4, dim)
+
+    # Loss = sum(soft) → constant gradient of +1 on every entry.
+    # With weight_decay = 1.0 and lr = 0.1, equilibrium |Δ| ~ 1.
+    def linear_loss(soft):
+        return soft.sum()
+
+    out = pez_search(
+        loss_fn=linear_loss,
+        token_embedding=emb,
+        prompt_length=4,
+        num_steps=200,                     # well past initial transient
+        learning_rate=0.1,
+        weight_decay=1.0,                  # strong anchor
+        seed=42,
+        device=torch.device("cpu"),
+        anchor_to=anchor,
+    )
+    # Δ should be bounded by weight_decay; without WD it would just
+    # diverge linearly. Generous bound — we just want to confirm the
+    # residual path is wired and the OU mean reversion is acting.
+    assert out.norm().item() < 100.0
+
+
+@pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")
+def test_torch_pez_search_anchor_and_initial_mutually_exclusive():
+    """Providing both anchor_to and initial_soft_prompt raises."""
+    import torch
+    from torch import nn
+
+    from src.pez.search import pez_search
+
+    emb = nn.Embedding(100, 64)
+    init = torch.randn(1, 4, 64)
+    anchor = torch.randn(1, 4, 64)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        pez_search(
+            loss_fn=lambda s: s.sum(),
+            token_embedding=emb,
+            prompt_length=4,
+            num_steps=1,
+            learning_rate=0.01,
+            weight_decay=0.0,
+            seed=0,
+            device=torch.device("cpu"),
+            initial_soft_prompt=init,
+            anchor_to=anchor,
+        )
 
 
 @pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")

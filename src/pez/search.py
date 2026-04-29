@@ -76,6 +76,7 @@ def pez_search(
     seed: int,
     device: torch.device,
     initial_soft_prompt: torch.Tensor | None = None,
+    anchor_to: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the continuous-PEZ optimization loop with a caller-supplied loss.
 
@@ -88,21 +89,37 @@ def pez_search(
         propagate back to the soft prompt directly.
     token_embedding
         CLIP's ``nn.Embedding`` for the token vocabulary. Used only for
-        random warm-start initialization (when
-        ``initial_soft_prompt is None``); not consulted inside the
+        random warm-start initialization (when both ``anchor_to`` and
+        ``initial_soft_prompt`` are None); not consulted inside the
         optimization loop.
     prompt_length
         N — the number of soft-prompt positions to optimize.
     num_steps
         Number of gradient steps.
     learning_rate, weight_decay
-        AdamW hyperparameters.
+        AdamW hyperparameters. ``weight_decay`` is applied to whichever
+        tensor is the optimization variable — soft_prompt directly
+        (anchored or unanchored warm start), or Δ in the residual
+        parameterization (when ``anchor_to`` is provided).
     seed
-        Random seed; controls the random init when warm-start is None.
+        Random seed; controls the random init when no warm-start.
     device
         Where to run the optimization.
     initial_soft_prompt : Tensor[1, prompt_length, dim] or None
-        Warm-start. If None, initialize from random vocabulary tokens.
+        Plain warm start. If provided, soft_prompt is initialized at
+        this tensor and AdamW operates on soft_prompt directly. Used
+        by PEZ-2 (whose anchor lives in the loss as L_anchor).
+    anchor_to : Tensor[1, prompt_length, dim] or None
+        Residual-parameterization anchor. If provided, optimize
+        Δ (initialized at 0); soft_prompt is ``anchor_to + Δ`` at
+        every step. AdamW's weight_decay decays Δ → 0, which decays
+        soft_prompt → anchor_to. Used by PEZ-1's SDS rounds (round
+        1+) to make the previous round's output a stable equilibrium
+        of the current round's optimization. See RESEARCH_PROPOSAL.md
+        §3.1 "Residual parameterization for SDS rounds."
+
+        ``anchor_to`` and ``initial_soft_prompt`` are mutually
+        exclusive — providing both raises ValueError.
 
     Returns
     -------
@@ -112,9 +129,41 @@ def pez_search(
         vocabulary unless you specifically need a human-readable form
         for logging.
     """
+    if initial_soft_prompt is not None and anchor_to is not None:
+        raise ValueError(
+            "anchor_to and initial_soft_prompt are mutually exclusive. "
+            "Use anchor_to for the residual-parameterization warm start "
+            "(decays soft_prompt toward anchor_to via weight_decay on Δ); "
+            "use initial_soft_prompt for a plain warm start (weight_decay "
+            "decays soft_prompt toward origin). See RESEARCH_PROPOSAL.md §3.1."
+        )
+
     torch.manual_seed(seed)
     np.random.seed(seed)
 
+    expected_shape = (1, prompt_length, token_embedding.weight.shape[1])
+
+    if anchor_to is not None:
+        # Residual parameterization: optimize Δ (init at 0).
+        # soft_prompt = anchor_to + Δ at every step.
+        if anchor_to.shape != expected_shape:
+            raise ValueError(
+                f"anchor_to shape {tuple(anchor_to.shape)} does not match "
+                f"{expected_shape}"
+            )
+        anchor = anchor_to.detach().clone().to(device=device, dtype=torch.float32)
+        delta = torch.zeros_like(anchor, requires_grad=True)
+        optimizer = torch.optim.AdamW(
+            [delta], lr=learning_rate, weight_decay=weight_decay
+        )
+        for _ in range(num_steps):
+            loss = loss_fn(anchor + delta)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        return (anchor + delta).detach()
+
+    # Non-anchored path: optimize soft_prompt directly.
     if initial_soft_prompt is None:
         vocab_size = token_embedding.weight.shape[0]
         random_ids = torch.randint(
@@ -122,11 +171,11 @@ def pez_search(
         )
         soft_prompt = token_embedding(random_ids).detach().clone()
     else:
-        if initial_soft_prompt.shape != (1, prompt_length, token_embedding.weight.shape[1]):
+        if initial_soft_prompt.shape != expected_shape:
             raise ValueError(
                 f"initial_soft_prompt shape "
                 f"{tuple(initial_soft_prompt.shape)} does not match "
-                f"(1, {prompt_length}, {token_embedding.weight.shape[1]})"
+                f"{expected_shape}"
             )
         soft_prompt = initial_soft_prompt.detach().clone()
 

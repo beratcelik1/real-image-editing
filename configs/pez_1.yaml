@@ -44,7 +44,27 @@ prompt_length: 15             # N positions in [N, 768]. Larger N →
 num_steps: 1500               # PEZ optimization steps. More for
                               # larger N or sds (vs clip).
 learning_rate: 0.1            # AdamW lr on the soft prompt
+
+# ─── Round-0 (vanilla PEZ) regularization ────────────────────────
+# Standard AdamW weight_decay; decays the soft prompt toward the
+# origin in CLIP embedding space. Fine for round 0 (random init) —
+# this is Wen-et-al's published default. NOT used for SDS rounds 1+;
+# those use delta_weight_decay below via the residual parameterization
+# P = c_anchor + Δ (proposal §3.1).
 weight_decay: 0.1
+
+# ─── Round-1+ (SDS-PEZ refinement) anchor strength ───────────────
+# AdamW.weight_decay applied to Δ in the residual parameterization
+# P = c_anchor + Δ where c_anchor is the previous round's output
+# (frozen). Decaying Δ → 0 means decaying P → c_anchor. This:
+#   1. Fixes the anti-anchoring default that pulls toward origin.
+#   2. Bounds SDS-noise drift (variance saturates at lr·σ²/(2·δ_wd)
+#      rather than growing linearly with steps).
+#   3. Makes c_anchor a stable equilibrium of round r's optimization.
+# Default 0.1 is a starting point; the research proposal (§8 Open
+# Question 9) flags this for empirical sweep on a small test set.
+delta_weight_decay: 0.1
+
 batch_size: 1
 # (No projection_every: continuous PEZ doesn't snap to vocabulary.)
 

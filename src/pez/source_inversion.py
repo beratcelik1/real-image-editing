@@ -215,16 +215,19 @@ def pez_invert_source(
                 timestep_sampling=config.timestep_sampling,
             )
 
+        # Residual parameterization for SDS rounds (proposal §3.1):
+        # anchor_to = previous round's output, optimize Δ (init at 0).
+        # weight_decay = delta_weight_decay (anchor strength on Δ).
         soft_prompt = pez_search(
             loss_fn=_sds_loss_fn,
             token_embedding=token_embedding,
             prompt_length=config.prompt_length,
             num_steps=config.num_steps,
             learning_rate=config.learning_rate,
-            weight_decay=config.weight_decay,
+            weight_decay=config.delta_weight_decay,
             seed=config.seed + round_idx,
             device=device,
-            initial_soft_prompt=soft_prompt,
+            anchor_to=soft_prompt,
         )
 
     # 6. Cache and return

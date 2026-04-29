@@ -40,7 +40,13 @@ class Pez1Config:
     # Optimization
     num_steps: int
     learning_rate: float
-    weight_decay: float
+    weight_decay: float            # round-0 vanilla-PEZ weight decay
+                                   # (Wen-et-al default; decays soft_prompt
+                                   # toward origin from random init).
+    delta_weight_decay: float      # round-1+ anchor strength via the
+                                   # residual parameterization
+                                   # P = c_anchor + Δ (proposal §3.1).
+                                   # AdamW.weight_decay applied to Δ.
     batch_size: int
 
     # Models

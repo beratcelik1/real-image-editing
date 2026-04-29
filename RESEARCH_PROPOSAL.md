@@ -580,6 +580,112 @@ prompt    = c_2
 null_text = N_1
 ```
 
+**Residual parameterization for SDS rounds (round-1+ anchoring).** The
+SDS rounds (1 and 2 above) need an additional implementation detail
+that the schematic above hides: how the warm start `c_(r-1)` is
+*preserved* during round `r`'s SDS optimization. Without explicit
+preservation, two pathologies appear:
+
+1. **AdamW's default `weight_decay` decays the soft prompt toward the
+   origin in CLIP embedding space, not toward the warm start.** This
+   is silently anti-anchoring: each step pulls the soft prompt away
+   from `c_(r-1)` (which is at some specific non-zero point) toward
+   the origin, and only SDS gradient counteracts the pull. The
+   converged solution sits at the balance between SDS-optimum and
+   origin, biased toward origin by `weight_decay × lr`. In Wen et
+   al.'s original PEZ this is fine — there's no warm start to
+   preserve — but in our alternating R=2 setup, the default
+   actively destroys the round-(r−1) → round-r warm start.
+2. **SDS gradient noise causes random-walk drift even when `c_(r-1)`
+   is already near-optimal.** SDS estimates have variance from random
+   timestep `t` and noise `ε` sampling. Without a restoring force,
+   the soft prompt's variance grows linearly with step count
+   (`Var(soft_prompt_t) = O(lr² · σ² · t)`), so noisy SDS gradients
+   accumulate as drift even if the true SDS gradient at `c_(r-1)`
+   is zero.
+
+The fix is a **residual reparameterization**:
+
+```
+P    = c_anchor + Δ          # c_anchor frozen (= round-(r-1) output)
+Δ_0  = 0                     # Δ is the new optimization variable
+optimize Δ via AdamW with weight_decay = δ_wd
+```
+
+At Δ = 0 the pipeline reproduces classic-PEZ-on-`c_anchor` exactly,
+so we recover the warm start as a literal initialization. AdamW's
+weight_decay term, applied to Δ, decays Δ → 0 — which means
+P → c_anchor. This converts AdamW's default "pull toward origin"
+into "pull toward c_anchor," using the existing weight_decay knob.
+
+**Algebraic equivalence.** Decaying Δ → 0 with AdamW gives:
+
+```
+Δ_{t+1} = Δ_t − lr · adam_step(grad) − lr · δ_wd · Δ_t
+P_{t+1} = c_anchor + Δ_{t+1}
+        = P_t − lr · adam_step(grad) − lr · δ_wd · (P_t − c_anchor)
+```
+
+— identical to "decay P toward c_anchor with strength δ_wd," but
+implemented via the optimizer rather than a `||P − c_anchor||²` term
+in the loss. The optimizer-side route is cleaner because AdamW's
+decoupled weight decay doesn't interact with momentum the way a loss
+term would (see Loshchilov & Hutter 2019 for the AdamW vs. Adam-with-
+L2 distinction).
+
+**Noise-variance bound (the practical payoff).** With weight_decay
+λ = δ_wd, Δ becomes a discrete-time AR(1) (Ornstein-Uhlenbeck)
+process. At equilibrium under pure noise (no signal):
+
+```
+Var(Δ_∞) ≈ lr · σ² / (2λ)         ← saturated, NOT growing with t
+```
+
+vs. λ = 0 where `Var(Δ_t) = lr² · σ² · t` grows linearly. Persistent
+SDS signal `g` still moves Δ to `g/λ` (bounded but proportional to
+the true gradient), so signal direction is preserved while the noise
+floor is capped. The practical effect: at the SDS optimum, the prompt
+sits *close to c_anchor with bounded noise variance*; far from the
+optimum, Δ moves coherently in the signal direction.
+
+**Three properties this gives the alternating algorithm:**
+
+1. **Fixes the anti-anchoring default.** No silent decay toward origin.
+2. **Bounded SDS-noise drift.** `c_(r-1)` becomes a stable equilibrium
+   of round `r`'s optimization, not just a starting point.
+3. **Residual-connection property.** At δ_wd = ∞ the pipeline reduces
+   to "do nothing"; at δ_wd = 0 the pipeline reduces to classic-PEZ
+   on `c_anchor`. δ_wd interpolates between "trust c_anchor fully"
+   and "trust SDS fully" — Δ activates only insofar as SDS genuinely
+   demands a correction.
+
+**Round 0 (vanilla PEZ from random init) is unchanged.** No warm
+start exists at round 0, so there's nothing to anchor to — the
+existing `weight_decay` (decaying toward origin) is the standard
+Wen-et-al regularization and stays as-is. The residual parameterization
+applies only to rounds 1+ (the SDS-PEZ refinement steps). This is
+why the implementation needs two independent config knobs:
+`weight_decay` (round-0 vanilla regularization, ≈ 0.1, Wen et al.
+default) and `delta_weight_decay` (round-1+ anchor strength on Δ,
+empirical sweep — see Open Question 5).
+
+**Why this anchor lives in the optimizer, not in the loss.** PEZ-2
+also has an anchor (the `L_anchor = ||soft_prompt − soft_prompt_init||²`
+term in §3.2's three-term loss), so a natural question is whether to
+unify them. We don't, intentionally:
+
+- PEZ-2's `γ_anchor` is a Knob-1 ablation parameter swept across
+  {0.01, 0.1, 1.0} — it's load-bearing for the §4.2 narrative as an
+  *explicit* loss coefficient, easier to interpret as a knob.
+- PEZ-1's `δ_wd` is a fixed-default thing whose only job is to
+  preserve the warm start across rounds; it's not a tuning knob the
+  user is expected to sweep.
+
+Same mechanism, two different roles. Keeping them as distinct
+implementations preserves the clarity of the proposal's narrative
+without compromising correctness — both routes implement the same
+mathematical effect at their respective stages.
+
 **Why this enforces the geometry partition (priority 1).** Each step's
 natural bias aligns to push geometry into null-text and semantics into
 the prompt:
@@ -1796,6 +1902,18 @@ they shape the methodology:
    et al. 2023) shows per-layer embeddings capture concepts more
    richly. Could PEZ-1 / PEZ-2 extend to the per-layer setting? Likely
    yes but adaptation needed.
+
+9. **Default for `delta_weight_decay` (PEZ-1 round-1+ residual
+   anchor).** §3.1's residual parameterization sets the round-1+
+   anchor strength via AdamW's weight_decay on Δ. The default is
+   currently a guess (0.1, mirroring PEZ-2's γ_anchor magnitude).
+   Worth A/B'ing across `δ_wd ∈ {0.0, 0.05, 0.1, 0.5}` on a small
+   test set, comparing reconstruction PSNR after each round AND
+   `‖c_r − c_(r-1)‖²` (drift magnitude per round). Expected pattern:
+   `δ_wd = 0` shows large drift even at SDS optimum (random walk);
+   high `δ_wd` shows tight anchoring at the cost of suppressing
+   genuine SDS corrections. Pick the elbow that bounds noise drift
+   without crippling refinement.
 
 ## 8a. Known limitations (not pursued in v1 or v2)
 

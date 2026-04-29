@@ -263,7 +263,8 @@ def pez_search(
     weight_decay: float,
     seed: int,
     device: torch.device,
-    initial_soft_prompt: torch.Tensor | None = None,  # warm-start
+    initial_soft_prompt: torch.Tensor | None = None,  # plain warm-start
+    anchor_to: torch.Tensor | None = None,            # residual anchor
 ) -> torch.Tensor:
     """Core continuous-PEZ optimization loop, generic over the loss
     function.
@@ -274,17 +275,33 @@ def pez_search(
 
     Algorithm (Wen et al. 2023's PEZ machinery without the straight-
     through vocabulary projection — see RESEARCH_PROPOSAL.md §3.1):
-      1. Initialize soft prompt (random, or from initial_soft_prompt
-         for warm-start).
+      1. Initialize the optimization variable:
+         - If `anchor_to` is provided: optimize Δ (initialized at 0);
+           soft prompt = `anchor_to + Δ` at every step. AdamW's
+           weight_decay decays Δ → 0, i.e., decays soft_prompt →
+           anchor_to. This is the **residual parameterization** for
+           PEZ-1's SDS rounds (round-1+ in source_inversion.py).
+         - Else if `initial_soft_prompt` is provided: warm-start the
+           soft prompt at that tensor; AdamW's weight_decay decays
+           soft_prompt → origin (Wen-et-al default behavior).
+         - Else: random init from vocab embeddings (round-0 vanilla
+           PEZ in source_inversion.py).
       2. For num_steps:
-         a. Compute loss = loss_fn(soft_prompt) — pluggable.
-         b. Backprop directly to soft_prompt. No vocabulary projection.
-         c. AdamW step on the soft prompt.
+         a. Compute loss = loss_fn(soft_prompt).
+         b. Backprop. No vocabulary projection.
+         c. AdamW step on the optimization variable
+            (Δ if anchored, soft_prompt otherwise).
       3. Return the final soft prompt as a continuous [N, 768] tensor.
 
-    The loss_fn closure captures whatever inputs the chosen loss
-    needs (target image embedding for L_clip; image latent + null-text
-    + unet for L_sds).
+    `initial_soft_prompt` and `anchor_to` are mutually exclusive.
+    The two routes serve different purposes:
+      • `anchor_to` is for warm-starts where we want the warm-start
+        point to be a stable equilibrium (PEZ-1 SDS rounds — see
+        proposal §3.1's "Residual parameterization" subsection).
+      • `initial_soft_prompt` is for warm-starts where the anchor is
+        implemented elsewhere — e.g., PEZ-2's three-term loss has an
+        explicit `L_anchor = ||soft_prompt - init||²` term, so the
+        optimizer doesn't need a residual parameterization.
 
     For human-readable logging only (NOT for downstream pipeline use),
     callers may snap the returned tensor to nearest CLIP vocabulary
@@ -318,20 +335,30 @@ def pez_invert_source(
           timestep, each shape [1, 77, 768]
 
     Algorithm (alternating with R=2 by default):
-      # Round 0: bootstrap (CLIP-only, fast)
-      c_0 = pez_search(loss_fn=clip_loss, ...)            # vanilla PEZ
+      # Round 0: bootstrap (CLIP-only, fast). No warm start, no anchor.
+      # weight_decay = config.weight_decay (Wen-et-al default; decays
+      # toward origin, which is fine here since there's nothing to
+      # anchor to from a random init).
+      c_0 = pez_search(loss_fn=clip_loss,
+                       weight_decay=config.weight_decay)
+
+      # Round 1+ uses the residual parameterization (proposal §3.1).
+      # weight_decay = config.delta_weight_decay (anchor strength on Δ).
+      # anchor_to = previous round's output (frozen during this round).
 
       # Round 1
       z_T, traj = ddim_inversion(image, c_0)
       N_0 = null_text_optimization(traj, c_0)             # existing code
-      c_1 = pez_search(loss_fn=sds_cfg_loss, null_text=N_0,
-                       initial_soft_prompt=c_0)
+      c_1 = pez_search(loss_fn=sds_cfg_loss(null_text=N_0),
+                       weight_decay=config.delta_weight_decay,
+                       anchor_to=c_0)
 
       # Round 2 (only if num_rounds >= 2)
       _, traj = ddim_inversion(image, c_1)
       N_1 = null_text_optimization(traj, c_1)
-      c_2 = pez_search(loss_fn=sds_cfg_loss, null_text=N_1,
-                       initial_soft_prompt=c_1)
+      c_2 = pez_search(loss_fn=sds_cfg_loss(null_text=N_1),
+                       weight_decay=config.delta_weight_decay,
+                       anchor_to=c_1)
 
       return c_R, N_(R-1)  # the last refined embeddings + matching null-text
 
