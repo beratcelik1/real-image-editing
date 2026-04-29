@@ -26,7 +26,8 @@ from src.config import Pez2Config
 from src.pez.losses import (
     assemble_77_token_embedding,
     encode_through_text_model,
-    sds_cfg_loss,
+    sample_sds_timestep_idx,
+    sds_cfg_loss_from_encoded,
 )
 from src.pez.search import pez_search
 
@@ -160,37 +161,11 @@ def pez_invert_with_instruction(
 
     # Build the joint loss closure
     def _joint_loss_fn(soft_prompt: torch.Tensor) -> torch.Tensor:
-        # L_source: SDS-CFG. Sample t_idx and look up BOTH the matching
-        # null-text AND the matching training-timestep value, then pass
-        # both to sds_cfg_loss so they stay coherent. Sampling t
-        # independently inside sds_cfg_loss (the prior bug) used null-text
-        # optimized for one timestep with U-Net at a different timestep,
-        # producing garbage eps_uncond (Bug #1).
-        if config.timestep_sampling == "uniform":
-            t_idx = torch.randint(0, T, (1,), device=device, dtype=torch.long)
-        else:
-            # Triangular bias toward mid-timesteps: sum of two Uniform[0,1]
-            # is triangular on [0,2] with mode 1; halving lands the mode at
-            # 0.5 → t_idx near T/2 where SDS gradient signal is strongest.
-            u1 = torch.rand(1, device=device)
-            u2 = torch.rand(1, device=device)
-            t_idx = (((u1 + u2) / 2) * T).long().clamp_(0, T - 1)
-        null_text_for_t = null_text_stacked[t_idx.item()]
-        t = scheduler_timesteps[t_idx.item()].view(1).to(device=device, dtype=torch.long)
-
-        l_source = sds_cfg_loss(
-            soft_prompt,
-            image_latent=image_latent,
-            null_text_embedding=null_text_for_t,
-            t=t,
-            cfg_scale=config.cfg_scale,
-            unet=unet,
-            scheduler=scheduler,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-        )
-
-        # L_instruction: text-text CLIP cosine
+        # Encode the soft prompt through CLIP once and reuse the
+        # contextual hidden state for L_source (cross-attn input to
+        # U-Net) and the pooled output for L_instruction. The prior
+        # implementation encoded the soft prompt twice per gradient
+        # step (Bug #7).
         full_embeds, eos_pos, pos_ids, attn_mask = assemble_77_token_embedding(
             soft_prompt,
             token_embedding=token_embedding,
@@ -198,9 +173,40 @@ def pez_invert_with_instruction(
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
         )
-        _, prompt_pooled = encode_through_text_model(
+        full_embeds = full_embeds.to(dtype=unet.dtype)
+        last_hidden, prompt_pooled = encode_through_text_model(
             full_embeds, pos_ids, attn_mask, eos_pos, text_encoder,
         )
+
+        # L_source: SDS-CFG. Sample t_idx (centralized in
+        # losses.sample_sds_timestep_idx — supports uniform /
+        # uniform_truncated / importance) and look up BOTH the
+        # matching null-text AND the matching training-timestep value
+        # so they stay coherent (Bug #1). Sampling t independently
+        # inside the loss would use null-text optimized for one
+        # timestep with U-Net at a different timestep, producing
+        # garbage eps_uncond.
+        t_idx = sample_sds_timestep_idx(
+            timestep_sampling=config.timestep_sampling,
+            T=T,
+            scheduler_timesteps=scheduler_timesteps,
+            num_train_timesteps=scheduler.config.num_train_timesteps,
+            device=device,
+        )
+        null_text_for_t = null_text_stacked[t_idx.item()]
+        t = scheduler_timesteps[t_idx.item()].view(1).to(device=device, dtype=torch.long)
+
+        l_source = sds_cfg_loss_from_encoded(
+            last_hidden_state=last_hidden,
+            image_latent=image_latent,
+            null_text_embedding=null_text_for_t,
+            t=t,
+            cfg_scale=config.cfg_scale,
+            unet=unet,
+            scheduler=scheduler,
+        )
+
+        # L_instruction: text-text CLIP cosine
         prompt_pooled_n = F.normalize(prompt_pooled, dim=-1)
         instr_pooled_n = F.normalize(instr_pooled.to(prompt_pooled.dtype), dim=-1)
         l_instr = -(prompt_pooled_n * instr_pooled_n).sum(dim=-1).mean()

@@ -14,7 +14,10 @@
 # is the project default.
 source_loss_type: sds         # "sds" or "clip"
 cfg_scale: 7.5                # only used when source_loss_type == "sds"
-timestep_sampling: uniform    # only used when source_loss_type == "sds"
+timestep_sampling: uniform_truncated   # only used when source_loss_type == "sds".
+                                       # See pez_1.yaml for the full mode taxonomy;
+                                       # uniform_truncated is DreamFusion's
+                                       # recommended default for SDS-CFG.
 
 # ─── Instruction-following term (always text-text CLIP cosine) ───
 # The instruction is text, not an image — SDS doesn't apply. Always

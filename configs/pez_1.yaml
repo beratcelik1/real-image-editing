@@ -23,9 +23,15 @@ cfg_scale: 7.5                # classifier-free guidance scale
                               # higher → sharper gradient, riskier
                               # over-saturation (DreamFusion findings)
 
-timestep_sampling: uniform    # "uniform" or "importance" — focus on
-                              # mid-timesteps where SDS signal is
-                              # strongest. Implement uniform first.
+timestep_sampling: uniform_truncated   # "uniform" / "uniform_truncated" / "importance".
+                                       # uniform_truncated drops edge timesteps
+                                       # (t < 2% or > 98% of num_train_timesteps)
+                                       # where SDS gradient is unstable —
+                                       # DreamFusion (Poole et al. 2022) standard.
+                                       # The recommended default for SDS-CFG.
+                                       # importance biases toward mid-timesteps
+                                       # via a triangular distribution; useful
+                                       # when SDS noise is high.
 
 # Number of DDIM denoising steps used in SDS rounds for both
 # ddim_inversion and null_text_optimization. MUST match

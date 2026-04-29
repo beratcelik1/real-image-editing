@@ -1297,6 +1297,68 @@ LCS-over-token-IDs with the per-position cosine threshold. No
 modifications to the K/V swap mechanism, the denoising loop, or
 LocalBlend itself.
 
+### 3.8 Deviations from prior work (and rationale)
+
+This section enumerates the project's deliberate deviations from the
+hyperparameters / mechanisms of the source papers (PEZ, P2P,
+DreamFusion). Listed for honest scoping and to pre-empt reviewer
+"why didn't you follow X's recommendation?" questions.
+
+**From Wen et al. 2023 (PEZ):**
+- **`prompt_length`: 4-16 typical → 75 (the CLIP-77 hard cap).** Wen
+  et al. used short prompts because their goal was concept inversion
+  for a single image. Our goal is full source-scene representation
+  with multi-subject capacity, requiring much more per-position
+  budget. See §3.0's REPLACE-mode notes.
+- **Straight-through vocabulary projection: dropped.** We're
+  continuous-PEZ throughout; the soft prompt is the canonical output.
+  Architectural decision to avoid the discrete-token-projection's
+  Voronoi-jump nonlinearities and to allow free continuous embedding
+  drift. See §3.1.
+- **Other PEZ machinery (`learning_rate=0.1`, `weight_decay=0.1`,
+  AdamW, `batch_size=1`):** ✓ unchanged from Wen et al.
+- **`num_steps`: 1000-3000 → 3000 (cap):** at the high end of Wen
+  et al.'s range, with adaptive early stopping shortcircuiting when
+  convergence is detected. Higher cap accommodates the larger N.
+
+**From Poole et al. 2022 (DreamFusion / SDS):**
+- **`cfg_scale`: 100 → 7.5.** DreamFusion's high CFG was for
+  *from-scratch text-to-image generation* (sharp gradient direction
+  needed). Our SDS is a *reconstruction-aware loss* paired with our
+  editing pipeline's CFG=7.5 — the SDS gradient should match the
+  editing-time CFG regime. Intentional and project-specific.
+- **Timestep sampling: ✓ DreamFusion-style truncation followed.**
+  `timestep_sampling: uniform_truncated` drops the t-edge timesteps
+  per [0.02·T_train, 0.98·T_train]. Was previously `uniform`
+  (vanilla); changed because edge timesteps make the SDS gradient
+  unstable. See §3.1's loss specification.
+
+**From Hertz et al. 2022 (Prompt-to-Prompt):**
+- **`cross_replace_steps` default: ✓ Hertz's word-swap value (0.4)
+  followed.** Earlier versions used 0.8 (Hertz's *additive*-edit
+  default), which biased toward conservative edits. Now corrected
+  to 0.4 for v1's REPLACE mode; ADD mode (R5) will override to 0.8
+  when it lands.
+- **`layer_indices` (which cross-attention layers): ✓ all (None
+  default).** Matches Hertz's recommendation.
+- **Self-attention injection (PnP, Tumanyan et al. 2023): omitted
+  in v1.** The proposal scoped this out (see Section 6 reuse map).
+  For substitution edits this is a tolerable compromise. **For
+  STYLE mode (R7), this is a real loss** — style is conventionally
+  handled in attention literature via self-attention or AdaIN-style
+  feature swapping. R7 will start cross-attention-only with lowered
+  `cross_replace_steps`; if that's insufficient, R7 will re-introduce
+  PnP self-attention specifically for STYLE mode. The architecture
+  is designed to accommodate this re-introduction without disturbing
+  the REPLACE / ADD / EXPLICIT_REPLACE machinery.
+
+**From Mokady et al. 2022 (Null-text Inversion):**
+- ✓ Followed: per-timestep null-text optimized for faithful
+  reconstruction; used at edit time in the unconditional CFG branch.
+- The proposal's PEZ-1 alternates between null-text optimization
+  and SDS-PEZ refinement — an extension on top of Mokady, not a
+  deviation from it.
+
 ## 4. Evaluation plan
 
 ### 4.1 Source-image inversion quality (sub-claim 1)
@@ -1969,16 +2031,27 @@ move toward style-axis" rather than "few positions move."
 - No changes to PEZ-1 or PEZ-2's algorithm — same machinery, just
   different operating point.
 
-**Open question for R7.** Cross-attention manipulation alone may be
-insufficient for stylistic edits — style is conventionally handled
-via self-attention or AdaIN-style feature swapping. v1 is P2P-only
-(cross-attention only). R7 starts with cross-attention only +
-lowered `cross_replace_steps`. If empirically that produces weak
-style effects, R7 may re-introduce PnP self-attention injection
-*for STYLE mode specifically*, leaving REPLACE unchanged.
+**Open question — likely answered by re-introducing PnP.** Cross-
+attention manipulation alone is widely understood to be insufficient
+for stylistic edits — style is conventionally handled via self-
+attention or AdaIN-style feature swapping. The original P2P paper
+itself noted this limitation, and Plug-and-Play Diffusion (Tumanyan
+et al. 2023) was developed specifically to address it via self-
+attention injection. v1 is P2P-only (cross-attention only) by
+project scope, but **R7 should plan to re-introduce PnP self-
+attention injection from the start** rather than try cross-attention-
+only first. The empirical evidence from prior work strongly suggests
+cross-attention alone is the wrong tool for global aesthetic shifts;
+attempting it first would just re-derive the known limitation.
 
-**Estimated time:** 1-2 weeks on top of R4 if cross-attention-only;
-2-4 weeks if PnP self-attention needs to be added.
+The re-introduction is contained to STYLE mode — REPLACE / ADD /
+EXPLICIT_REPLACE all stay cross-attention-only and don't change.
+The architecture is designed for this: the CrossAttentionController
+already has `is_cross` switching, and adding a parallel
+SelfAttentionController for STYLE is a natural extension.
+
+**Estimated time:** 2-4 weeks on top of R4 (PnP self-attention
+implementation + integration with the editing loop's mode dispatch).
 
 These phases (R5, R6, R7) are non-load-bearing for the project's main
 contribution (the two-PEZ + P2P architecture), but they materially

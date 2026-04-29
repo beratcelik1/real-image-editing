@@ -261,16 +261,23 @@ def edit_image(
     return edited
 
 
-def prepare_source_inversion(
+def prepare_p2p_inputs(
     image: Image.Image,
     source_embeddings: torch.Tensor,
     sd_components: dict,
     edit_config: EditConfig,
-) -> torch.Tensor:
-    """Compute z_T for a (image, source_embeddings) pair, returning the
-    inverted latent. Decoupled from :func:`run_p2p_edit` so sweep loops
-    can compute z_T once and reuse it across the inner cross_replace_steps
-    loop (Bug #6 fix).
+) -> dict:
+    """Compute the source-side invariants reused across an outer sweep.
+
+    For a (image, source_embeddings) pair, returns the inverted latent
+    z_T, the CLIP-encoded contextual source embedding, and the empty-
+    prompt uncond embedding. The outer sweep over (λ, γ) varies only
+    target_embeddings; the inner sweep over cross_replace_steps varies
+    only the controller's injection schedule. None of these change z_T
+    / source_emb / uncond_emb, so they're computed once outside the
+    loop and threaded through ``run_p2p_edit`` via its
+    ``cached_*`` kwargs (Bug #8 fix; supersedes the earlier
+    z_T-only ``prepare_source_inversion``).
     """
     tokenizer = sd_components["tokenizer"]
     text_encoder = sd_components["text_encoder"]
@@ -281,7 +288,7 @@ def prepare_source_inversion(
     dtype = _str_to_dtype(edit_config.dtype)
 
     src = _ensure_batched(source_embeddings).to(device=device)
-    source_emb = _encode_continuous_prompt(src, text_encoder, tokenizer, dtype)
+    source_emb = encode_continuous_prompt(src, text_encoder, tokenizer, dtype)
     uncond_emb = get_uncond_embeddings(tokenizer, text_encoder, device)
     image_latent = encode_image(image, vae, device).to(dtype=dtype)
     z_T, _ = ddim_inversion(
@@ -290,7 +297,11 @@ def prepare_source_inversion(
         num_steps=edit_config.ddim.num_steps,
         cfg_scale=edit_config.ddim.cfg_scale,
     )
-    return z_T
+    return {
+        "z_T": z_T,
+        "source_emb": source_emb,
+        "uncond_emb": uncond_emb,
+    }
 
 
 def run_p2p_edit(
@@ -302,6 +313,10 @@ def run_p2p_edit(
     local_blend_config: LocalBlendConfig,
     null_text_per_timestep: list[torch.Tensor] | None = None,
     cached_z_T: torch.Tensor | None = None,
+    cached_source_emb: torch.Tensor | None = None,
+    cached_target_emb: torch.Tensor | None = None,
+    cached_uncond_emb: torch.Tensor | None = None,
+    cached_alignment: tuple[list[int], list[int]] | None = None,
 ) -> Image.Image:
     """Run a P2P + LocalBlend edit on *image* given source/target embeddings.
 
@@ -356,12 +371,20 @@ def run_p2p_edit(
         denoising step. If None or length-mismatched, falls back to
         the standard "" CLIP encoding (Bug #2 — without this, edits
         lose Mokady-style faithful source reconstruction).
-    cached_z_T
-        Optional pre-computed inverted latent. When sweeping over
-        edit-time hyperparameters with the same source, callers can
-        compute z_T once via :func:`prepare_source_inversion` and pass
-        it here to avoid redoing DDIM inversion 27× per (image,
-        instruction) pair (Bug #6 fix).
+    cached_z_T, cached_source_emb, cached_target_emb,
+    cached_uncond_emb, cached_alignment
+        Optional pre-computed invariants that callers can hoist out of
+        outer / inner sweep loops to avoid redundant work (Bug #8
+        fix). ``cached_z_T`` / ``cached_source_emb`` / ``cached_uncond_emb``
+        depend only on (image, source_embeddings) and are produced
+        once by :func:`prepare_p2p_inputs`. ``cached_target_emb``
+        depends only on target_embeddings (vary across the (λ, γ)
+        outer loop, hold across the cross_replace_steps inner loop).
+        ``cached_alignment`` is the ``(matched, unmapped_target)`` pair
+        from :func:`align_pez_prompts`; depends on (source_embeddings,
+        target_embeddings) and the alignment threshold/method.
+        Any kwarg left as ``None`` falls back to in-function
+        recomputation, so callers can incrementally adopt the cache.
 
     Returns
     -------
@@ -389,9 +412,21 @@ def run_p2p_edit(
     src = _ensure_batched(source_embeddings).to(device=device)
     tgt = _ensure_batched(target_embeddings).to(device=device)
 
-    source_emb = _encode_continuous_prompt(src, text_encoder, tokenizer, dtype)
-    target_emb = _encode_continuous_prompt(tgt, text_encoder, tokenizer, dtype)
-    uncond_emb = get_uncond_embeddings(tokenizer, text_encoder, device)
+    source_emb = (
+        cached_source_emb.to(device=device, dtype=dtype)
+        if cached_source_emb is not None
+        else encode_continuous_prompt(src, text_encoder, tokenizer, dtype)
+    )
+    target_emb = (
+        cached_target_emb.to(device=device, dtype=dtype)
+        if cached_target_emb is not None
+        else encode_continuous_prompt(tgt, text_encoder, tokenizer, dtype)
+    )
+    uncond_emb = (
+        cached_uncond_emb.to(device=device, dtype=dtype)
+        if cached_uncond_emb is not None
+        else get_uncond_embeddings(tokenizer, text_encoder, device)
+    )
 
     if cached_z_T is None:
         image_latent = encode_image(image, vae, device).to(dtype=dtype)
@@ -426,11 +461,14 @@ def run_p2p_edit(
                 f"recover faithful Mokady-style null-text inversion."
             )
 
-    matched, unmapped_target = align_pez_prompts(
-        src.squeeze(0), tgt.squeeze(0),
-        threshold=edit_config.alignment_threshold,
-        method=edit_config.alignment_method,
-    )
+    if cached_alignment is not None:
+        matched, unmapped_target = cached_alignment
+    else:
+        matched, unmapped_target = align_pez_prompts(
+            src.squeeze(0), tgt.squeeze(0),
+            threshold=edit_config.alignment_threshold,
+            method=edit_config.alignment_method,
+        )
     # Convert matched-position list to {src: tgt} mapping for the
     # CrossAttentionController. Warm-start gives same-position
     # correspondence, so the mapping is the identity over matched.
@@ -494,19 +532,21 @@ def _ensure_batched(emb: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Expected [N, D] or [1, N, D]; got shape {tuple(emb.shape)}")
 
 
-def _encode_continuous_prompt(
-    soft_prompt: torch.Tensor,    # [1, N, D]
+def encode_continuous_prompt(
+    soft_prompt: torch.Tensor,    # [N, D] or [1, N, D]
     text_encoder,
     tokenizer,
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """Run a continuous PEZ embedding through CLIP's text model.
 
-    Wraps the [1, N, D] soft prompt with BOS/EOS/padding to 77
-    positions and runs the result through CLIP's text transformer
-    (bypassing the embedding lookup since we already have the input
-    embeddings). Returns [1, 77, D] contextual hidden states.
+    Wraps the soft prompt with BOS/EOS/padding to 77 positions and
+    runs the result through CLIP's text transformer (bypassing the
+    embedding lookup since we already have the input embeddings).
+    Returns [1, 77, D] contextual hidden states. Accepts [N, D] or
+    [1, N, D]; promotes to batched form internally.
     """
+    soft_prompt = _ensure_batched(soft_prompt)
     token_embedding = text_encoder.text_model.embeddings.token_embedding
     full_embeds, eos_pos, pos_ids, attn_mask = assemble_77_token_embedding(
         soft_prompt.to(dtype),
@@ -541,16 +581,27 @@ def _run_editing_loop(
 ) -> torch.Tensor:
     """Run the editing denoising loop with a [source, target] batch.
 
-    Implements the core P2P loop: at each step run U-Net under
-    (uncond, source, uncond, target) batch with CFG, then advance the
-    cross-attention controller's step counter (which also advances any
-    attached LocalBlend).
+    Implements the core P2P loop: at each step run U-Net under a
+    4-batch CFG layout, recover source / target ε via CFG, advance the
+    scheduler, then advance the cross-attention controller (which also
+    advances any attached LocalBlend).
+
+    Batch layout (Bug #1 fix). The 4-batch is ordered
+    ``[uncond_src, cond_src, uncond_tgt, cond_tgt]`` — the src and tgt
+    halves are contiguous, NOT (uncond_pair, cond_pair). This is what
+    :class:`CrossAttentionController` expects: ``attn[:half]`` is the
+    full source pass (uncond+cond) and ``attn[half:]`` is the full
+    target pass (uncond+cond), so the P2P injection
+    ``target[:, :, :, tgt_tok] = source[:, :, :, src_tok]`` correctly
+    overwrites cond_tgt's column with cond_src's column. The prior
+    layout ``[uncond_src, uncond_tgt, cond_src, cond_tgt]`` made
+    ``attn[:half]`` the uncond pair and ``attn[half:]`` the cond pair,
+    so the injection silently overwrote cond_tgt with uncond_src
+    (null-text attention).
 
     If ``null_text_per_timestep`` is provided, the i-th entry replaces
-    ``uncond_emb`` at step i — this is the Mokady-style null-text
-    inversion (faithful source reconstruction at edit time). Without
-    it, the standard default-uncond fallback applies and source
-    reconstruction is only approximate.
+    ``uncond_emb`` at step i — Mokady-style null-text inversion
+    (faithful source reconstruction at edit time).
     """
     scheduler.set_timesteps(num_steps)
     # Stack into batch [source, target]
@@ -564,17 +615,19 @@ def _run_editing_loop(
         else:
             ut = uncond_emb
 
-        # CFG batch: [uncond_src, uncond_tgt, cond_src, cond_tgt]
-        latent_in = torch.cat([latent, latent], dim=0)
-        embed_in = torch.cat([
-            ut, ut,                          # uncond for both
-            source_emb, target_emb,          # cond for source/target
-        ], dim=0)
+        # CFG batch: [uncond_src, cond_src, uncond_tgt, cond_tgt].
+        # latent has rows [src, tgt]; repeat_interleave doubles each
+        # row to [src, src, tgt, tgt] so it lines up with the embed
+        # ordering above.
+        latent_in = latent.repeat_interleave(2, dim=0)
+        embed_in = torch.cat([ut, source_emb, ut, target_emb], dim=0)
         with torch.no_grad():
             noise_pred = unet(latent_in, t, encoder_hidden_states=embed_in).sample
-        # Split and apply CFG
-        eps_uncond, eps_cond = noise_pred.chunk(2)
-        eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+        # Recover (uncond, cond) for src and tgt and apply CFG per-pair.
+        eu_src, ec_src, eu_tgt, ec_tgt = noise_pred.chunk(4)
+        eps_src = eu_src + cfg_scale * (ec_src - eu_src)
+        eps_tgt = eu_tgt + cfg_scale * (ec_tgt - eu_tgt)
+        eps = torch.cat([eps_src, eps_tgt], dim=0)
         latent = scheduler.step(eps, t, latent).prev_sample
 
         # Advance the cross-attention controller (which also calls

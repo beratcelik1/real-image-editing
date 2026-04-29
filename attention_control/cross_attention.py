@@ -46,7 +46,9 @@ Batch convention
 Word-swap expects the batch dimension to be laid out as
 ``[source…, target…]``.  For CFG-free inference this means batch=2
 (one source, one target); with classifier-free guidance it is batch=4
-(uncond_source, uncond_target, cond_source, cond_target).
+(``[uncond_src, cond_src, uncond_tgt, cond_tgt]``) — the src and tgt
+halves are kept contiguous so ``attn[:half]`` / ``attn[half:]`` slice
+the right rows for the injection.
 
 Re-weighting has no batch layout requirement and works with any batch size.
 """

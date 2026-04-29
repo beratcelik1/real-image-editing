@@ -24,6 +24,7 @@ from src.pez.losses import (
     assemble_77_token_embedding,
     clip_similarity_loss,
     encode_through_text_model,
+    sample_sds_timestep_idx,
     sds_cfg_loss,
 )
 from src.pez.search import pez_search
@@ -51,6 +52,7 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
     config_str = (
         f"{config.loss_type}|cfg={config.cfg_scale}|"
         f"ts_sampling={config.timestep_sampling}|"
+        f"ddim_steps={config.ddim_num_steps}|"
         f"N={config.prompt_length}|steps={config.num_steps}|"
         f"lr={config.learning_rate}|"
         f"wd={config.weight_decay}|dwd={config.delta_weight_decay}|"
@@ -187,7 +189,7 @@ def pez_invert_source(
             uncond_emb,
             unet,
             scheduler,
-            num_steps=50,                 # standard
+            num_steps=config.ddim_num_steps,
             cfg_scale=config.cfg_scale,
         )
 
@@ -198,7 +200,7 @@ def pez_invert_source(
             uncond_emb,
             unet,
             scheduler,
-            num_steps=50,
+            num_steps=config.ddim_num_steps,
             cfg_scale=config.cfg_scale,
             opt_steps=10,
             lr=1e-2,
@@ -342,17 +344,17 @@ def _sds_loss_with_t_sampled_null_text(
     device = image_latent.device
     T = null_text_per_timestep.shape[0]
 
-    if timestep_sampling == "uniform":
-        t_idx = torch.randint(0, T, (1,), device=device, dtype=torch.long)
-    else:  # "importance" — triangular bias toward mid-timesteps.
-        # Sum of two Uniform[0,1] draws is triangular on [0,2] with mode 1;
-        # halving puts the mode at 0.5 and the support back to [0,1].
-        # SDS gradient signal is strongest at mid-timesteps (DreamFusion);
-        # the prior `1 - sqrt(1-u)` formula peaked at u=0 instead, biasing
-        # toward the noisiest end (timesteps[0] = highest training-t).
-        u1 = torch.rand(1, device=device)
-        u2 = torch.rand(1, device=device)
-        t_idx = (((u1 + u2) / 2) * T).long().clamp_(0, T - 1)
+    # Sample t_idx (centralized in losses.sample_sds_timestep_idx — supports
+    # uniform / uniform_truncated / importance modes; truncated is the
+    # DreamFusion-recommended default for SDS, drops edge timesteps where
+    # the gradient is unstable).
+    t_idx = sample_sds_timestep_idx(
+        timestep_sampling=timestep_sampling,
+        T=T,
+        scheduler_timesteps=scheduler_timesteps,
+        num_train_timesteps=scheduler.config.num_train_timesteps,
+        device=device,
+    )
 
     null_text_for_t = null_text_per_timestep[t_idx.item()]      # [1, 77, D]
     t = scheduler_timesteps[t_idx.item()].view(1).to(device=device, dtype=torch.long)

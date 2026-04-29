@@ -145,6 +145,67 @@ def _build_causal_attention_mask(bsz, seq_len, dtype, device):
 
 
 # ---------------------------------------------------------------------------
+# SDS timestep sampling (called by both PEZ-1 and PEZ-2 wrappers)
+# ---------------------------------------------------------------------------
+
+
+def sample_sds_timestep_idx(
+    timestep_sampling: str,
+    T: int,
+    scheduler_timesteps: torch.Tensor,
+    num_train_timesteps: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample a denoising-step index `t_idx ∈ [0, T)` for SDS-CFG.
+
+    Modes:
+      - "uniform": vanilla uniform over [0, T). Includes edge timesteps
+        (t≈0, t≈T_train) where SDS gradient is unstable.
+      - "uniform_truncated" (DreamFusion-style, recommended): uniform
+        over indices whose actual training-timestep value falls in
+        [0.02·T_train, 0.98·T_train]. Avoids the edge instabilities
+        per Poole et al. 2022.
+      - "importance": triangular distribution biased toward mid-
+        timesteps where SDS signal is strongest.
+
+    Returns a [1] long tensor on `device`.
+    """
+    if timestep_sampling == "uniform":
+        return torch.randint(0, T, (1,), device=device, dtype=torch.long)
+
+    if timestep_sampling == "uniform_truncated":
+        # DreamFusion-style truncation: drop edge timesteps where SDS
+        # gradient is degenerate. With T=50 and num_train_timesteps=1000
+        # this typically just trims the highest-noise (t≈980) and
+        # lowest-noise (t≈1) endpoints.
+        lo = 0.02 * num_train_timesteps
+        hi = 0.98 * num_train_timesteps
+        ts_cpu = scheduler_timesteps.detach().cpu()
+        valid_indices = [i for i in range(T)
+                         if lo <= float(ts_cpu[i]) <= hi]
+        if not valid_indices:
+            # Pathological: no valid indices. Fall back to full uniform
+            # to avoid a runtime crash; warn at first call.
+            return torch.randint(0, T, (1,), device=device, dtype=torch.long)
+        choice = torch.randint(0, len(valid_indices), (1,), device=device).item()
+        return torch.tensor([valid_indices[choice]], device=device, dtype=torch.long)
+
+    if timestep_sampling == "importance":
+        # Triangular distribution biased toward mid-timesteps where SDS
+        # signal is strongest (DreamFusion). Sum of two Uniform[0,1]
+        # draws is triangular on [0,2] with mode at 1; halving puts the
+        # mode at 0.5 and support back to [0,1].
+        u1 = torch.rand(1, device=device)
+        u2 = torch.rand(1, device=device)
+        return (((u1 + u2) / 2) * T).long().clamp_(0, T - 1)
+
+    raise ValueError(
+        f"Unknown timestep_sampling={timestep_sampling!r}; "
+        f"use 'uniform', 'uniform_truncated', or 'importance'."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Loss A — CLIP cosine similarity (vanilla PEZ, used for warm-start)
 # ---------------------------------------------------------------------------
 
@@ -236,13 +297,17 @@ def sds_cfg_loss(
     consistently: the caller picks t_idx, looks up
     ``null_text_per_timestep[t_idx]``, derives ``t = scheduler.timesteps[t_idx]``,
     and passes both — guaranteeing they're aligned.
+
+    For callers that already have the [1, 77, D] CLIP-encoded prompt
+    (e.g. PEZ-2 reuses it for L_instruction), use
+    :func:`sds_cfg_loss_from_encoded` directly to avoid a duplicate
+    text-encoder forward.
     """
-    device = soft_prompt.device
     dtype = unet.dtype
 
-    # 1. Encode the soft prompt through CLIP text model to get the
-    # 77×768 conditional encoding. This is the prompt embedding that
-    # the U-Net's cross-attention will see.
+    # Encode the soft prompt through CLIP text model to get the 77×768
+    # conditional encoding. This is the prompt embedding that the
+    # U-Net's cross-attention will see.
     full_embeds, _, position_ids, attention_mask = assemble_77_token_embedding(
         soft_prompt,
         token_embedding=text_encoder.text_model.embeddings.token_embedding,
@@ -250,24 +315,49 @@ def sds_cfg_loss(
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     )
-    # Cast embeds to model dtype for U-Net
     full_embeds = full_embeds.to(dtype=dtype)
     eos_position = 1 + soft_prompt.shape[1]
     last_hidden_state, _ = encode_through_text_model(
         full_embeds, position_ids, attention_mask, eos_position, text_encoder,
     )
-    # last_hidden_state is [1, 77, D] — the encoder_hidden_states for U-Net.
 
-    # 2. Compute x_t under the caller-provided timestep.
+    return sds_cfg_loss_from_encoded(
+        last_hidden_state=last_hidden_state,
+        image_latent=image_latent,
+        null_text_embedding=null_text_embedding,
+        t=t,
+        cfg_scale=cfg_scale,
+        unet=unet,
+        scheduler=scheduler,
+    )
+
+
+def sds_cfg_loss_from_encoded(
+    last_hidden_state: torch.Tensor,        # [1, 77, D] already encoded by CLIP
+    image_latent: torch.Tensor,             # [1, 4, H, W] VAE-encoded source
+    null_text_embedding: torch.Tensor,      # [1, 77, D] frozen null-text at timestep t
+    t: torch.Tensor,                        # [1] long, the timestep used for U-Net
+    cfg_scale: float,
+    unet,
+    scheduler,
+) -> torch.Tensor:
+    """Variant of :func:`sds_cfg_loss` that takes the soft prompt's
+    contextual hidden states directly.
+
+    PEZ-2's joint loss reuses the CLIP-encoded soft prompt for both the
+    SDS branch (``last_hidden_state`` here) and the L_instruction branch
+    (which only needs the pooled output). Encoding once and calling this
+    avoids a second CLIP-text forward per gradient step.
+    """
+    device = last_hidden_state.device
+    dtype = unet.dtype
+
     eps = torch.randn_like(image_latent)
     alpha_cumprod_t = scheduler.alphas_cumprod[t].to(device=device, dtype=dtype)
     sqrt_alpha = alpha_cumprod_t.sqrt()
     sqrt_one_minus_alpha = (1 - alpha_cumprod_t).sqrt()
     x_t = sqrt_alpha * image_latent.to(device=device, dtype=dtype) + sqrt_one_minus_alpha * eps
 
-    # 3. CFG forward pass: two U-Net calls. The unconditional pass is
-    # frozen (null-text is detached, x_t/eps don't depend on soft_prompt),
-    # so wrap in no_grad to skip building its autograd graph.
     null_text_on_dev = null_text_embedding.to(device=device, dtype=dtype)
     with torch.no_grad():
         eps_uncond = unet(
@@ -278,5 +368,4 @@ def sds_cfg_loss(
     ).sample
     eps_cfg = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
 
-    # 4. SDS surrogate loss: MSE against the sampled noise.
     return F.mse_loss(eps_cfg.float(), eps.float())

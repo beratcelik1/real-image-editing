@@ -89,47 +89,48 @@ class LocalBlend:
     # ------------------------------------------------------------------
 
     def record_cross_attention(self, attn_4d: torch.Tensor) -> None:
-        """Accumulate the target half's attention to selected token positions.
+        """Accumulate the cond-target row's attention to selected token positions.
 
         Parameters
         ----------
         attn_4d : Tensor[batch, heads, spatial, tokens]
-            Cross-attention probabilities, batch laid out as
-            ``[source..., target...]``. Only the target half is used.
+            Cross-attention probabilities. Under CFG (batch=4) the
+            layout is ``[uncond_src, cond_src, uncond_tgt, cond_tgt]``;
+            without CFG (batch=2) it is ``[src, tgt]``. In both cases
+            the LAST batch row is the cond-target pass — the only one
+            we want for the additive-edit mask. Pre-Bug-#1-fix this
+            sliced ``attn_4d[half:]`` and averaged uncond_tgt + cond_tgt
+            together, diluting the mask with null-text attention.
         """
         bsz, heads, spatial, tokens = attn_4d.shape
-        half = bsz // 2
-        if half == 0:
-            return  # No target half — single-prompt run, nothing to record
+        if bsz < 2:
+            return  # Single-prompt run, no target row to record
 
-        # Slice target half, average across heads, select the configured
-        # target tokens, average over selected tokens. Result: per-patch
+        # Take only the last batch row (cond_tgt under CFG, tgt
+        # without). Average across heads, select the configured target
+        # tokens, average over selected tokens. Result: per-patch
         # attention to "the new content" tokens.
-        target = attn_4d[half:].detach()  # [half, heads, spatial, tokens]
-        target = target.mean(dim=1)        # [half, spatial, tokens]
+        target = attn_4d[-1:].detach()    # [1, heads, spatial, tokens]
+        target = target.mean(dim=1)        # [1, spatial, tokens]
         target_at_tokens = target[
             :, :, [i for i in self.target_token_indices if i < tokens]
         ]
         if target_at_tokens.shape[-1] == 0:
             return  # All target_token_indices were out of range
-        per_patch = target_at_tokens.mean(dim=-1)  # [half, spatial]
+        per_patch = target_at_tokens.mean(dim=-1)  # [1, spatial]
 
         # Resample to the canonical resolution.
         side = int(round(math.sqrt(spatial)))
         if side * side != spatial:
             # Non-square attention map; skip.
             return
-        per_patch_2d = per_patch.reshape(half, 1, side, side)
+        per_patch_2d = per_patch.reshape(1, 1, side, side)
         per_patch_2d = F.interpolate(
             per_patch_2d.float(),
             size=(self.base_resolution, self.base_resolution),
             mode="bilinear",
             align_corners=False,
-        ).squeeze(1)  # [half, base_resolution, base_resolution]
-
-        # Average across the target batch (usually half=1, but support
-        # CFG batch=4 → half=2).
-        per_patch_2d = per_patch_2d.mean(dim=0)  # [base_res, base_res]
+        ).squeeze(1).squeeze(0)  # [base_resolution, base_resolution]
 
         # Accumulate
         if self._accumulator_sum is None:

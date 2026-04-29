@@ -25,13 +25,16 @@ ddim:
 cross_attention:
   # Fraction of denoising steps with P2P injection active. Lower values
   # give the target prompt more freedom in late steps. Google's
-  # canonical defaults from prompt-to-prompt_stable.ipynb:
-  #   word swap (cat -> dog):       0.4
-  #   adding tokens (+ bowtie):     0.8
+  # canonical defaults from prompt-to-prompt_stable.ipynb (Hertz et
+  # al. 2022, used here as published guidance):
+  #   word swap (cat -> dog):       0.4   ← REPLACE-mode default
+  #   adding tokens (+ bowtie):     0.8   ← ADD-mode default (future)
   #   re-weighting:                 1.0
-  # 0.8 here is a moderate default; per-edit-type tuning is part of
-  # the Knob 2 ablation.
-  cross_replace_steps: 0.8
+  # v1 only ships REPLACE, so the default tracks Hertz's word-swap
+  # recommendation. ADD-mode (R5) will need to override this to 0.8
+  # when it lands. Per-edit-type tuning is also part of Knob 2's
+  # ablation in the notebook (KNOB_2_GRID).
+  cross_replace_steps: 0.4
   layer_indices: null         # null = all cross-attention layers
 
 # Edit mode (RESEARCH_PROPOSAL.md §3.0). Four rule-based modes; v1
