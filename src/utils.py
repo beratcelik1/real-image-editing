@@ -163,14 +163,25 @@ def load_sd_components(
 
     if model_id is None:
         model_id = MODEL_ID_SD21
-        try:
-            tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-        except OSError:
-            print(f"Cannot access {model_id} (needs HF auth). Falling back to SD 1.5.")
+
+    # SD 2.1-base is gated — without an HF token (or without having
+    # accepted the model's terms), HF returns 404 for every file in the
+    # repo. Fall back to SD 1.5 (non-gated) so the notebook still runs.
+    # Applies regardless of who supplied model_id, since callers reading
+    # from config can't know the auth state at runtime.
+    try:
+        tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+    except OSError:
+        if model_id == MODEL_ID_SD21:
+            print(
+                f"Cannot access {model_id} (gated repo — accept terms at "
+                f"https://huggingface.co/{model_id} and set HF_TOKEN, or "
+                f"continue with SD 1.5). Falling back to SD 1.5."
+            )
             model_id = MODEL_ID_SD15
             tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-    else:
-        tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        else:
+            raise
 
     print(f"Using model: {model_id}")
 
