@@ -11,23 +11,40 @@ def _patch_hf_chat_template_404() -> None:
 
     transformers calls ``list_repo_tree(repo, "additional_chat_templates")``
     inside ``CLIPTokenizer.from_pretrained``. CLIP doesn't have chat
-    templates, so HF returns 404. transformers catches
-    ``RepositoryNotFoundError`` internally — but with newer
-    huggingface_hub the exception path / class doesn't always match
-    the catch, so it escapes to the user as a fatal error even though
-    the model is fine.
+    templates, so HF returns 404. The exception escapes to the user as
+    a fatal error even though the model is fine.
 
-    Patch at TWO layers:
-      1. ``huggingface_hub.hf_api.HfApi.list_repo_tree`` — wrap the
-         generator so any 404 on ``additional_chat_templates`` becomes
-         an empty iterator. This is the most direct intercept.
-      2. ``huggingface_hub.utils._pagination.paginate`` — same idea but
-         at a layer below. Defense-in-depth in case transformers'
-         import order or the underlying call path changes.
+    Why this is hard to patch correctly: ``huggingface_hub.hf_api`` does
+    ``from .utils._pagination import paginate`` at module-import time,
+    binding ``paginate`` as a *local* name in ``hf_api``. Patching
+    ``_pagination.paginate`` after that does NOT update ``hf_api``'s
+    local reference. Same for ``list_repo_tree`` if a caller imports it
+    as a free function.
+
+    The most reliable fix is to short-circuit at the TOP — replace
+    ``transformers.utils.hub.list_repo_templates`` to always return
+    empty. CLIP tokenizers have no chat templates, so empty is the
+    correct return value. We also patch lower layers as belt-and-
+    suspenders.
 
     Idempotent; safe to call multiple times.
     """
-    # Layer 1: patch list_repo_tree (the function transformers calls).
+    # Layer 0 (most reliable): replace transformers.utils.hub.list_repo_templates
+    # with a function that returns []. This is the function CLIPTokenizer's
+    # from_pretrained calls; intercepting here bypasses the entire HF
+    # network call chain for the chat-template lookup.
+    try:
+        import transformers.utils.hub as _t_hub
+        if not getattr(_t_hub, "_chat_template_404_patched", False):
+            def _no_chat_templates(*args, **kwargs):
+                return []
+            _t_hub.list_repo_templates = _no_chat_templates
+            _t_hub._chat_template_404_patched = True
+    except ImportError:
+        pass  # transformers not installed; nothing to patch
+
+    # Layer 1: patch huggingface_hub.hf_api.HfApi.list_repo_tree —
+    # in case anything else calls it for additional_chat_templates.
     try:
         from huggingface_hub import hf_api
     except ImportError:
@@ -52,7 +69,10 @@ def _patch_hf_chat_template_404() -> None:
         hf_api.HfApi.list_repo_tree = _patched_list_repo_tree
         hf_api._chat_template_404_patched = True
 
-    # Layer 2: patch paginate (the function called by list_repo_tree).
+    # Layer 2: patch the module-level paginate in BOTH locations — the
+    # canonical _pagination.paginate AND the local copy in hf_api (which
+    # was bound at hf_api's import time via `from .utils._pagination
+    # import paginate`).
     try:
         from huggingface_hub.utils import _pagination
     except ImportError:
@@ -70,13 +90,19 @@ def _patch_hf_chat_template_404() -> None:
                 raise
 
         _pagination.paginate = _patched_paginate
+        # Also patch hf_api's local reference if it has one — this is the
+        # critical step the prior commit missed.
+        if hasattr(hf_api, "paginate"):
+            hf_api.paginate = _patched_paginate
         _pagination._chat_template_404_patched = True
 
 
-# Apply the patch BEFORE any transformers import — transformers reads
-# huggingface_hub.utils._pagination.paginate / hf_api.list_repo_tree at
-# import time in some versions. So this needs to run before
-# `from transformers import ...`.
+# Apply the patch BEFORE any transformers import. The Layer-0 patch
+# above relies on `transformers` being importable, so this must run
+# AFTER `import transformers` is possible but BEFORE any code triggers
+# the chat-template lookup. By calling here at module-import time of
+# src/utils.py, we ensure the patch is in place before anything in
+# this module (or downstream) loads CLIPTokenizer.
 _patch_hf_chat_template_404()
 
 
