@@ -401,7 +401,7 @@ Each subsection maps to one or more of the sub-claims in Section 2.
 
 ### 3.0 Edit modes (rule-based, user-supplied)
 
-The system exposes three modes. The user picks a mode explicitly via
+The system exposes four modes. The user picks a mode explicitly via
 a config flag (`EditConfig.mode`); the system does **not** auto-detect
 edit type from the instruction text. This is a deliberate trade-off
 against an LLM- or heuristic-classifier: CLIP can't reliably parse
@@ -410,23 +410,43 @@ brittle on ambiguous cases (see Section 8a). Putting the mode in the
 user's hands eliminates a class of "did the system guess my intent?"
 failures.
 
-| Mode | User input | What it does | Status |
-|---|---|---|---|
-| **REPLACE** | A target descriptor: `"cat"`, `"brown fur"`, `"old"`, `"smiling"`. | Drift one or more positions of PEZ-1's source embeddings to encode the target. Optimizer (3-term joint loss) decides *which* positions move. Covers substitution and attribute change in §8a's taxonomy. | **v1** |
-| **ADD** | An object/accessory noun: `"bowtie"`, `"sunglasses"`, `"snow on the ground"`. | A new object renders in a localized region of the source; nothing else changes. | Future |
-| **EXPLICIT_REPLACE** | A source-target pair: `"dog" → "cat"`, `"leash" → "rope"`. | Same as REPLACE in spirit, but the user pre-localizes which content they want changed by naming the source word. The system finds the matching position via cosine and drifts only that one. | Future |
+| Mode | User input | Position scope | LocalBlend | Status |
+|---|---|---|---|---|
+| **REPLACE** | Target descriptor: `"cat"`, `"brown fur"` | All N drift jointly | OFF | **v1** |
+| **ADD** | Object noun: `"bowtie"` | First N anchored + K free slots | **ON** | Future (R5) |
+| **EXPLICIT_REPLACE** | Source-target pair: `"dog → cat"` | One position unfrozen, N-1 frozen | OFF | Future (R6) |
+| **STYLE** | Style descriptor: `"whimsical"`, `"oil painting"` | All N drift jointly (low γ_anchor preset) | OFF | Future (R7) |
 
-The three modes share **the same PEZ-1 + P2P + LocalBlend pipeline**
-described in §3.1, §3.3, and Appendix A. They differ only in PEZ-2's
-optimization setup (which positions are unfrozen, and whether
-prompt_length is extended). PEZ-1 is mode-agnostic.
+Three architectural mechanisms underlie the four modes:
+
+1. **Free-position drift, no LocalBlend** (REPLACE + STYLE — different (λ, γ) presets).
+2. **Single-position drift, no LocalBlend** (EXPLICIT_REPLACE).
+3. **N anchored + K free slots, with LocalBlend** (ADD).
+
+LocalBlend is **ADD-mode-specific by design**. It exists to spatially
+gate *new* cross-attention content that has no source-region prior
+(the additive object's column wasn't in PEZ-1's optimization, so its
+attention can leak across the image without a mask). REPLACE and
+EXPLICIT_REPLACE don't need LocalBlend: the drifted positions
+inherited their cross-attention spatial pattern from PEZ-1's
+optimization, which already localized them to specific source regions.
+STYLE doesn't use LocalBlend either — there's no localized region
+because the edit is global. See §3.3 for the LocalBlend mechanism
+detail and Appendix A for the API.
+
+PEZ-1 is mode-agnostic — same alternating R=2 algorithm for all four
+modes. The mode flag steers PEZ-2's optimization setup and the
+editing-time configuration.
 
 #### REPLACE (v1)
 
 - **Input.** A descriptor of desired post-edit content (not an
   imperative — "cat" or "a sleeping cat", not "change the dog to a
-  cat"). The descriptor's CLIP-text-encoder pooled vector is fed to
-  PEZ-2's `L_instr` term.
+  cat"). For best results, phrase as a *complete* description of
+  the target image content, not just the changed-content noun (see
+  §8a — richer pooled embeddings cancel out shared axes in the
+  cosine gradient and concentrate drift on the actually-different
+  axes).
 - **PEZ-2 setup.** All N positions of `pez_1_embeddings` are unfrozen
   and used as the warm-start. The 3-term joint loss (§3.2) runs as
   specified.
@@ -434,12 +454,16 @@ prompt_length is extended). PEZ-1 is mode-agnostic.
   mode never needs free slots — it works by drift, not extension —
   so every position is source-detail capacity. The proposal's
   detail-richness argument (§3.2) is fully active in this mode.
+- **LocalBlend disabled.** Drifted positions' cross-attention is
+  naturally region-localized (inherited from PEZ-1's optimization),
+  so spatial gating is unnecessary. Forcing it on would over-mask.
 - **Failure modes.** If the source has multiple subjects or the
   target word is far from any PEZ-1 position in CLIP space, the
-  joint loss may fail to localize the edit cleanly. EXPLICIT_REPLACE
+  joint loss may fail to localize the edit cleanly (every position
+  drifts slightly, contaminating non-target content). EXPLICIT_REPLACE
   is the principled fallback for those cases (future).
 
-#### ADD (future)
+#### ADD (future, R5)
 
 - **Input.** A noun describing the object to add.
 - **PEZ-2 setup.** Variable-length: `prompt_length_pez_2 = N + K`.
@@ -451,16 +475,15 @@ prompt_length is extended). PEZ-1 is mode-agnostic.
   instruction has nowhere natural to land — the optimizer must
   displace existing source content to make room, sacrificing detail.
   Free slots with zero anchor pull are *cheaper* to modify than
-  anchored slots (they have no L_source pull either, since padding
-  tokens contribute minimally to reconstruction), so the optimizer
-  routes additive content there by gradient.
-- **Alignment.** Per-position cosine threshold over the first N
-  positions identifies any incidental drift; the last K positions
-  are unmapped by construction (initialized to padding, drifted to
-  encode the new content). LocalBlend's `target_token_indices` is
-  the K positions plus any drifted positions in the first N.
+  anchored slots, so the optimizer routes additive content there.
+- **LocalBlend enabled.** This is the only mode that uses LocalBlend.
+  The new content's cross-attention has no spatial prior from PEZ-1
+  (it didn't exist there), so without a mask it could leak across
+  the image. LocalBlend's `target_token_indices = the K free-slot
+  positions`; the mask gates target-attention to render new content
+  in a focused region while preserving source structure elsewhere.
 
-#### EXPLICIT_REPLACE (future)
+#### EXPLICIT_REPLACE (future, R6)
 
 - **Input.** A source-target pair `(source_word, target_word)`.
 - **Localization.** Encode `source_word` through CLIP's text encoder
@@ -470,19 +493,52 @@ prompt_length is extended). PEZ-1 is mode-agnostic.
   top-k for repeated subjects).
 - **PEZ-2 setup.** All positions frozen (`requires_grad=False`)
   *except* the localized one. L_instr targets `target_word`'s CLIP
-  encoding. L_source and L_anchor still apply (with anchor weight
-  perhaps higher than REPLACE since we trust the user's localization
-  more than the optimizer's discovery).
+  encoding. L_source still applies; L_anchor is mostly irrelevant
+  since other positions are explicitly frozen.
+- **LocalBlend disabled.** Same reasoning as REPLACE — the localized
+  position's cross-attention is region-localized from PEZ-1.
 - **Why this is more reliable than REPLACE.** When the user knows
   exactly what's in the source and what they want it to become, an
   explicit pair eliminates the "which position should drift?"
-  question that REPLACE's joint loss has to answer implicitly.
+  question that REPLACE's joint loss has to answer implicitly. The
+  multi-subject failure mode REPLACE has is structurally absent.
 - **Trade-off vs. REPLACE.** Loses REPLACE's serendipitous detail-
   discovery (the "PEZ-2 finds bombay cat for a black husky"
   property from §3.2) — explicit replacement honors only the
   literal target word, not the closest source-matched specialization.
   Use REPLACE when you want detail richness; use EXPLICIT_REPLACE
   when you want reliability and explicit control.
+
+#### STYLE (future, R7)
+
+- **Input.** A style descriptor: `"whimsical"`, `"oil painting"`,
+  `"low-light photography"`, `"black and white"`. Distinct from
+  content/attribute substitution (REPLACE) — style edits affect the
+  *whole* rendering, not a localized subject region.
+- **PEZ-2 setup.** Same as REPLACE structurally (all N positions
+  unfrozen, 3-term joint loss), but with **different
+  hyperparameter presets**: `γ_anchor` lower so all positions can
+  drift toward style-axis (the desired behavior for global edits),
+  `cross_replace_steps` lower so the target prompt drives more of
+  the denoising rendering.
+- **LocalBlend disabled.** Same reasoning — the edit isn't localized,
+  so masking would defeat the purpose.
+- **Why this is structurally different from REPLACE.** REPLACE's
+  defaults are calibrated to encourage *minimal* drift (preserve
+  most positions, edit a few). STYLE's defaults flip that: drift
+  *all* positions, that's the point. Conflating the two via a single
+  REPLACE mode would either under-edit on style (LocalBlend masks
+  too much, anchor too tight) or over-edit on content (everything
+  drifts, table-becomes-cat-style contamination). The mode separation
+  encodes which behavior the user wants.
+- **Why we may eventually want self-attention manipulation here.**
+  Style is conventionally handled in attention literature via
+  self-attention or AdaIN-style feature swapping. v1 is P2P-only
+  (cross-attention manipulation only — see proposal scope). STYLE
+  mode in R7 will start with cross-attention only (just lowered
+  `cross_replace_steps`). If empirically that's insufficient, R7
+  may re-introduce self-attention injection in PnP-style for STYLE
+  mode specifically.
 
 ### 3.1 PEZ on the source image (sub-claim 1)
 
@@ -1048,14 +1104,27 @@ identical length and per-position correspondence by construction.
                                     # cross-attention
   ```
   τ ≈ 0.95 (cosine similarity) is a reasonable starting point.
-- **The local-blend mask is built from cross-attention at the
-  unmapped positions.** The mask spatially localizes where the edit
-  should appear; outside the mask, source structure is preserved via
-  P2P injection.
 
 The threshold τ is the only new hyperparameter relative to the prior
 LCS design. LCS had implicit choices (gap penalties, tie-breaking);
 the cosine threshold replaces those with one explicit knob.
+
+**LocalBlend is ADD-mode-specific.** The original P2P paper (Hertz et
+al. 2022) introduced LocalBlend specifically for additive edits —
+new content being added to the prompt has no source-region prior in
+PEZ-1's optimization, so its cross-attention can leak across the
+image. LocalBlend builds a spatial mask from the additive content's
+cross-attention to gate that leakage.
+
+For REPLACE and EXPLICIT_REPLACE modes, drifted positions inherited
+their cross-attention spatial pattern from PEZ-1's optimization,
+which already localized them to specific source regions. Adding
+LocalBlend on top would over-mask without gain. For STYLE mode the
+edit is global; spatial gating defeats the purpose. So **LocalBlend
+is enabled only in ADD mode** (see §3.0); the other three modes
+disable it. Appendix A specifies the LocalBlend mechanism; the v1
+implementation builds it but only ADD mode (R5, future) actually
+constructs and attaches an instance.
 
 **Why not classical mixture-of-experts.** A reasonable architectural
 alternative is composed classifier-free guidance (Liu et al. 2022):
@@ -1071,13 +1140,13 @@ We don't use this because:
 1. It generates from scratch — doesn't preserve source structure.
    Would still need DDIM inversion + P2P on top to get editing
    behavior.
-2. It blends globally — no spatial localization. Local blend (which
-   we use) provides the spatial mechanism this approach lacks.
+2. It blends globally — no spatial localization. Local blend (used
+   in ADD mode) provides the spatial mechanism this approach lacks.
 3. SD has one generator. "Experts" in our setting are conditioning
    regions in the 77×768 prompt tensor, not separate models. Our
    P2P-based setup IS an MoE — at the cross-attention level, with
-   token positions as experts and local blend as spatial gating —
-   matching SD's architecture natively.
+   token positions as experts and (in ADD mode) local blend as
+   spatial gating — matching SD's architecture natively.
 
 ### 3.4 Note on the prior "bounded refinement" phase
 
@@ -1124,22 +1193,33 @@ per-position cosine distance exceeds the threshold τ, marking them
 target's column. The new content stays at its position, untouched
 by the alignment mechanism.
 
-For substitution edits (`dog → cat` semantic shift):
+For substitution edits in **REPLACE mode** (`dog → cat`):
 - Most source/target positions have low cosine distance → matched →
   P2P injects.
 - The shifted position has high cosine distance → unmapped → P2P
-  leaves alone → cat-direction embedding's cross-attention renders.
+  leaves alone → cat-direction embedding's cross-attention renders
+  the cat in the (PEZ-1-localized) animal region. **No LocalBlend
+  needed** — the drifted position's cross-attention inherited its
+  spatial pattern from PEZ-1's optimization.
 
-For additive edits (`+ a bowtie`):
-- Most positions stay at PEZ-1's embeddings (anchor pull) → matched.
-- One or two positions drift to encode bowtie content → unmapped →
-  free to render new content; cross-attention to those positions
-  drives the local-blend mask.
+For additive edits in **ADD mode** (`+ a bowtie`):
+- Most original positions stay at PEZ-1's embeddings (anchor pull) →
+  matched.
+- The K free-slot positions encode bowtie content → unmapped by
+  construction (initialized to padding, drifted to encode the new
+  object) → free to render new content.
+- **LocalBlend is essential here** — the K free-slot positions had
+  no PEZ-1 spatial prior (they didn't exist there), so without a
+  mask their cross-attention could leak across the image. The mask
+  is built from the K positions' cross-attention and gates rendering
+  to a focused region.
 
 In both cases, the architecture's correctness comes from the warm-
 start property keeping PEZ-2 close to PEZ-1 except where the
 instruction demands change, and per-position cosine distance
-identifying that "except where" automatically.
+identifying that "except where" automatically. ADD mode adds
+LocalBlend on top because additive content uniquely needs spatial
+gating (no source-region prior to inherit). REPLACE doesn't.
 
 ### 3.6 Computational requirements summary
 
@@ -1825,11 +1905,11 @@ R4 by weeks 4-7.
 
 ---
 
-### Future phases — modes ADD and EXPLICIT_REPLACE
+### Future phases — modes ADD, EXPLICIT_REPLACE, STYLE
 
 The v1 milestones above implement only the REPLACE mode (see §3.0).
-The other two modes are future work, mechanically scoped here so the
-v1 architecture doesn't preclude them.
+The other three modes are future work, mechanically scoped here so
+the v1 architecture doesn't preclude them.
 
 #### Phase R5 — ADD mode (variable-length PEZ-2)
 
@@ -1869,7 +1949,38 @@ constrained PEZ-2 with all other positions frozen.
 
 **Estimated time:** 1 week on top of R4.
 
-These phases are non-load-bearing for the project's main
+#### Phase R7 — STYLE mode (global rendering shift)
+
+**Goal.** Support style-descriptor inputs like `"whimsical"`,
+`"oil painting"`, `"low-light photography"` that shift the *whole*
+image's rendering rather than swapping a localized subject. Distinct
+from REPLACE because the desired drift pattern is "all positions
+move toward style-axis" rather than "few positions move."
+
+**Files to modify:**
+- `EditConfig.mode` accepts `"style"`. Validation guard releases.
+- `run_p2p_edit` skips LocalBlend (same as REPLACE) and uses
+  STYLE-tuned `cross_replace_steps` defaults (lower than REPLACE
+  so the target prompt drives more of the rendering).
+- `Pez2Config` gains optional STYLE-mode hyperparameter presets
+  (or callers override via `_apply_overrides_nested`):
+  γ_anchor lower (e.g., 0.01) so all positions can drift; λ
+  higher (e.g., 2.0) so the style-axis pull dominates.
+- No changes to PEZ-1 or PEZ-2's algorithm — same machinery, just
+  different operating point.
+
+**Open question for R7.** Cross-attention manipulation alone may be
+insufficient for stylistic edits — style is conventionally handled
+via self-attention or AdaIN-style feature swapping. v1 is P2P-only
+(cross-attention only). R7 starts with cross-attention only +
+lowered `cross_replace_steps`. If empirically that produces weak
+style effects, R7 may re-introduce PnP self-attention injection
+*for STYLE mode specifically*, leaving REPLACE unchanged.
+
+**Estimated time:** 1-2 weeks on top of R4 if cross-attention-only;
+2-4 weeks if PnP self-attention needs to be added.
+
+These phases (R5, R6, R7) are non-load-bearing for the project's main
 contribution (the two-PEZ + P2P architecture), but they materially
 expand the supported edit envelope and are natural extensions once
 v1 is validated.
@@ -1984,7 +2095,7 @@ language instructions toward "what would an image of this look
 like." Modal/intentional words get washed out by content nouns.
 
 **Categories of instruction the system handles well**, mapped to the
-three rule-based modes from §3.0:
+four rule-based modes from §3.0:
 
 - **Substitution** (REPLACE mode in v1; EXPLICIT_REPLACE for
   multi-subject or far-from-head-noun cases) — user supplies a target
@@ -1994,13 +2105,14 @@ three rule-based modes from §3.0:
   descriptor: `"brown fur"`, `"smiling"`, `"old"`. Mechanically
   identical to substitution: drift one or more positions toward the
   target attribute.
-- **Addition** (ADD mode, future) — user supplies a noun: `"bowtie"`,
-  `"sunglasses"`. Variable-length PEZ-2 puts the new content in
-  unanchored free slots.
-- **Style change** — currently no dedicated mode; users can attempt
-  it via REPLACE with a style descriptor (`"black and white"`), but
-  LocalBlend may over-mask since style is global. A possible future
-  fourth mode would disable LocalBlend for this case.
+- **Addition** (ADD mode, future R5) — user supplies a noun:
+  `"bowtie"`, `"sunglasses"`. Variable-length PEZ-2 puts the new
+  content in unanchored free slots; LocalBlend gates rendering.
+- **Style change** (STYLE mode, future R7) — user supplies a style
+  descriptor: `"whimsical"`, `"oil painting"`, `"black and white"`.
+  Distinct from REPLACE because the edit is global; LocalBlend is
+  disabled and (λ, γ) presets encourage uniform drift across all
+  positions.
 
 **Categories that fail or degrade gracefully:**
 - **Behavioral / preference / mental-state instructions** — e.g.,
@@ -2048,12 +2160,17 @@ The mode-based design (§3.0) constrains user inputs to specific
 shapes per mode, which sidesteps most phrasing issues:
 
 - **REPLACE mode** takes a target descriptor — a content/attribute
-  noun phrase, not an imperative. `"cat"` ✓, `"a sleeping cat"` ✓,
-  `"change the dog to a cat"` ✗ (the verb confuses CLIP).
-- **ADD mode** (future) takes an object noun — `"bowtie"` ✓,
+  noun phrase, not an imperative, and *not a style*. `"cat"` ✓,
+  `"a sleeping cat"` ✓, `"change the dog to a cat"` ✗ (the verb
+  confuses CLIP), `"whimsical"` ✗ (this is STYLE, not REPLACE).
+- **ADD mode** (future R5) takes an object noun — `"bowtie"` ✓,
   `"add a bowtie"` ✗.
-- **EXPLICIT_REPLACE** (future) takes a pair — `("dog", "cat")`,
+- **EXPLICIT_REPLACE** (future R6) takes a pair — `("dog", "cat")`,
   not a sentence.
+- **STYLE mode** (future R7) takes a style/aesthetic descriptor —
+  `"whimsical"` ✓, `"oil painting"` ✓, `"low-light"` ✓,
+  `"black and white"` ✓, but NOT a content noun (route those to
+  REPLACE).
 
 This is what makes "rule-based modes" a meaningful design choice
 over the prior "auto-detect from instruction text" approach: the

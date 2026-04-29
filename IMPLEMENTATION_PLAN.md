@@ -436,14 +436,14 @@ research proposal.
 
 ### 4.0 Edit-mode scope for v1
 
-The research proposal defines three rule-based edit modes (§3.0):
-**REPLACE**, **ADD**, **EXPLICIT_REPLACE**. **v1 implements only
-REPLACE.** ADD and EXPLICIT_REPLACE are future work (R5/R6 in the
-proposal).
+The research proposal defines four rule-based edit modes (§3.0):
+**REPLACE**, **ADD**, **EXPLICIT_REPLACE**, **STYLE**. **v1
+implements only REPLACE.** ADD, EXPLICIT_REPLACE, and STYLE are
+future work (R5/R6/R7 in the proposal).
 
 Implementation guard rails for v1:
 - `EditConfig` carries a `mode: str` field. Only `"replace"` is
-  accepted; `"add"` and `"explicit_replace"` raise
+  accepted; `"add"`, `"explicit_replace"`, and `"style"` raise
   `NotImplementedError` with a pointer to RESEARCH_PROPOSAL.md §3.0.
 - `prompt_length` in `pez_1.yaml` is maxed (default 15). REPLACE
   mode never reserves free slots — every position is source-detail
@@ -452,6 +452,13 @@ Implementation guard rails for v1:
 - `pez_invert_with_instruction` operates as REPLACE-mode by default:
   all N positions of `pez_1_embeddings` are unfrozen and used as the
   warm-start; the 3-term joint loss optimizes them jointly.
+- **LocalBlend is disabled in REPLACE mode** even if
+  `local_blend_config.enabled = True`. Per the proposal §3.0,
+  LocalBlend is ADD-mode-specific (it spatially gates additive
+  content that has no source-region prior). REPLACE-mode drifted
+  positions inherited their cross-attention spatial pattern from
+  PEZ-1's optimization — they're already region-localized, no
+  mask needed. `run_p2p_edit` enforces this regardless of config.
 
 PEZ-2 reuses the same loss-pluggable `pez_search` from Step 3, but
 with a three-term loss (source-preservation + instruction-following +
@@ -910,6 +917,13 @@ Once the REPLACE-mode pipeline works end-to-end, the next plans
   encoding and runs PEZ-2 with all other positions frozen. Extends
   `pez_search` with a `frozen_positions: set[int]` argument; adds
   `mode: "explicit_replace"` validation. (R6 in the proposal §7.)
+- **STYLE-mode plan**: same machinery as REPLACE (all N drift, no
+  LocalBlend, no free slots) but with style-tuned hyperparameter
+  presets — γ_anchor lower, λ higher, cross_replace_steps lower.
+  No structural changes to PEZ-1 or PEZ-2; just `mode: "style"`
+  validation and per-mode preset defaults. (R7 in the proposal §7.)
+  May re-introduce PnP self-attention injection if cross-attention
+  alone proves insufficient for stylistic edits.
 - **Evaluation plan**: implementing edit-quality metrics, ablation
   infrastructure, the (λ, γ) × (cross_replace_steps) two-knob grid
   (R4 in the proposal).

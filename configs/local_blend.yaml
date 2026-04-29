@@ -1,4 +1,16 @@
-# LocalBlend: spatial gating mechanism for additive edits
+# LocalBlend: spatial gating mechanism for additive edits.
+#
+# ADD-mode-specific: see RESEARCH_PROPOSAL.md §3.0 and §3.3.
+# LocalBlend gates the cross-attention of new (additive) content
+# whose attention has no PEZ-1 spatial prior — it would otherwise
+# leak across the image. REPLACE / EXPLICIT_REPLACE / STYLE modes
+# disable LocalBlend (drifted positions are already region-localized
+# from PEZ-1's optimization, or the edit is global and a mask
+# defeats the purpose).
+#
+# In v1, ADD mode is not implemented — `run_p2p_edit` forces
+# LocalBlend off in REPLACE mode regardless of `enabled` below.
+# This config is the durable spec for when ADD mode lands (R5).
 #
 # Used by: attention_control/local_blend.py
 # Specification: docs/p2p_pnp/ (Appendix A in RESEARCH_PROPOSAL.md)

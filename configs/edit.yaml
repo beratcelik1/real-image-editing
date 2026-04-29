@@ -34,23 +34,35 @@ cross_attention:
   cross_replace_steps: 0.8
   layer_indices: null         # null = all cross-attention layers
 
-# Edit mode (RESEARCH_PROPOSAL.md §3.0). Three rule-based modes; v1
-# implements only REPLACE. ADD and EXPLICIT_REPLACE raise
+# Edit mode (RESEARCH_PROPOSAL.md §3.0). Four rule-based modes; v1
+# implements only REPLACE. ADD, EXPLICIT_REPLACE, and STYLE raise
 # NotImplementedError with a pointer to the proposal.
 #
 #   "replace"           — user input: target descriptor (e.g. "cat",
 #                         "brown fur"). PEZ-2 drifts one or more
 #                         existing positions toward the target.
-#                         All N positions unfrozen; max prompt_length.
-#                         Implemented in v1.
+#                         All N positions unfrozen; max prompt_length;
+#                         LocalBlend DISABLED (drifted positions are
+#                         region-localized via PEZ-1's optimization,
+#                         no spatial gating needed). Implemented in v1.
 #   "add"               — user input: object noun (e.g. "bowtie").
 #                         PEZ-2 allocates K extra free slots warm-
 #                         started from padding tokens; the new
-#                         content lands there. Future (R5).
+#                         content lands there. LocalBlend ENABLED —
+#                         this is the only mode that uses LocalBlend,
+#                         to spatially gate the new content (which
+#                         has no PEZ-1 spatial prior). Future (R5).
 #   "explicit_replace"  — user input: (source_word, target_word) pair.
 #                         System cosine-localizes the source word to
 #                         a PEZ-1 position and drifts only that one.
-#                         Future (R6).
+#                         LocalBlend disabled (same reasoning as
+#                         REPLACE). Future (R6).
+#   "style"             — user input: style descriptor (e.g.
+#                         "whimsical", "oil painting"). Same code
+#                         path as REPLACE (all N drift, no LocalBlend),
+#                         but different (λ, γ, cross_replace_steps)
+#                         presets — calibrated for global drift
+#                         instead of minimal drift. Future (R7).
 mode: replace
 
 # Per-position alignment between PEZ-1 and PEZ-2 continuous embeddings.

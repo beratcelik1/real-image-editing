@@ -127,7 +127,7 @@ def test_run_p2p_edit_rejects_unsupported_modes():
     src_emb = torch.randn(1, 4, 768)
     tgt_emb = torch.randn(1, 4, 768)
 
-    for bad_mode in ("add", "explicit_replace"):
+    for bad_mode in ("add", "explicit_replace", "style"):
         cfg = dc_replace(edit_cfg, mode=bad_mode)
         with pytest.raises(NotImplementedError, match="not implemented in v1"):
             run_p2p_edit(

@@ -372,9 +372,9 @@ def run_p2p_edit(
         raise NotImplementedError(
             f"Edit mode {edit_config.mode!r} is not implemented in v1. "
             "Only 'replace' is currently supported. See "
-            "RESEARCH_PROPOSAL.md §3.0 for the full mode taxonomy and "
-            "§7 (Phases R5/R6) for the planned ADD and EXPLICIT_REPLACE "
-            "implementations."
+            "RESEARCH_PROPOSAL.md §3.0 for the full four-mode taxonomy "
+            "and §7 (Phases R5/R6/R7) for the planned ADD, "
+            "EXPLICIT_REPLACE, and STYLE implementations."
         )
 
     tokenizer = sd_components["tokenizer"]
@@ -440,8 +440,15 @@ def run_p2p_edit(
     mapping = {i + 1: i + 1 for i in matched}
     unmapped_in_77 = [i + 1 for i in unmapped_target]
 
+    # LocalBlend is ADD-mode-specific (see RESEARCH_PROPOSAL.md §3.0).
+    # REPLACE mode uses the natural cross-attention region-localization
+    # inherited from PEZ-1's optimization; gating with a mask would
+    # over-restrict. We force LocalBlend off here regardless of the
+    # config, so users can leave local_blend.yaml's `enabled: true` as
+    # the durable ADD-mode spec without affecting REPLACE behavior.
+    # When ADD mode lands (R5), this guard relaxes to also accept "add".
     local_blend = None
-    if local_blend_config.enabled and unmapped_in_77:
+    if edit_config.mode == "add" and local_blend_config.enabled and unmapped_in_77:
         local_blend = LocalBlend(
             target_token_indices=unmapped_in_77,
             threshold=local_blend_config.threshold,
