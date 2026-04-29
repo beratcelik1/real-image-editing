@@ -36,15 +36,24 @@ from src.utils import encode_image, get_uncond_embeddings, load_sd_components
 
 
 def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
-    """Hash key for caching: image bytes + relevant config fields."""
+    """Hash key for caching: image bytes + every config field that
+    affects the optimization result.
+
+    Includes (Bug #4 fix): weight_decay (round-0 reg), delta_weight_decay
+    (round-1+ residual anchor — the new key knob from §3.1), learning_rate,
+    timestep_sampling. Tuning any of these changes the output, so they
+    must invalidate the cache.
+    """
     h = hashlib.sha256()
     h.update(image.tobytes())
     h.update(image.size[0].to_bytes(4, "little"))
     h.update(image.size[1].to_bytes(4, "little"))
-    # Hash the config fields that affect the result.
     config_str = (
         f"{config.loss_type}|cfg={config.cfg_scale}|"
+        f"ts_sampling={config.timestep_sampling}|"
         f"N={config.prompt_length}|steps={config.num_steps}|"
+        f"lr={config.learning_rate}|"
+        f"wd={config.weight_decay}|dwd={config.delta_weight_decay}|"
         f"R={config.num_rounds}|seed={config.seed}|"
         f"clip={config.clip_model}"
     )
@@ -196,17 +205,25 @@ def pez_invert_source(
         )
 
         # 5c. SDS-PEZ refinement with frozen null-text.
-        # Use a single representative null-text embedding for the SDS
-        # forward pass — the t-sampling chooses a random timestep, so
-        # we look up null_text[t] inside the loss.
-        null_text_stacked = torch.stack(null_text, dim=0)  # [T, 1, 77, D]
+        # Move null-text tensors to the optimization device explicitly
+        # (they may have been loaded from CPU on cache hit — see Bug #3).
+        # Stack along a leading T dim so t_idx-sampling is a clean lookup.
+        null_text_stacked = torch.stack(
+            [nt.detach().to(device=device) for nt in null_text], dim=0,
+        )  # [T, 1, 77, D]
+        # scheduler.timesteps gives the actual training-timestep value
+        # at each denoising-step index; we need this so the wrapper can
+        # pass the matching `t` into sds_cfg_loss alongside null_text[t_idx].
+        scheduler.set_timesteps(null_text_stacked.shape[0])
+        scheduler_timesteps = scheduler.timesteps.to(device=device)
 
         def _sds_loss_fn(soft_prompt_in: torch.Tensor) -> torch.Tensor:
-            # Sample t inside the loss so we pick the matching null-text.
+            # Sample t and the matching null-text together; pass both.
             return _sds_loss_with_t_sampled_null_text(
                 soft_prompt_in,
                 image_latent=image_latent,
                 null_text_per_timestep=null_text_stacked,
+                scheduler_timesteps=scheduler_timesteps,
                 cfg_scale=config.cfg_scale,
                 unet=unet,
                 scheduler=scheduler,
@@ -297,6 +314,7 @@ def _sds_loss_with_t_sampled_null_text(
     projected: torch.Tensor,
     image_latent: torch.Tensor,
     null_text_per_timestep: torch.Tensor,    # [T, 1, 77, D]
+    scheduler_timesteps: torch.Tensor,        # [T] long, denoising-step → actual timestep
     cfg_scale: float,
     unet,
     scheduler,
@@ -304,34 +322,39 @@ def _sds_loss_with_t_sampled_null_text(
     tokenizer,
     timestep_sampling: str,
 ) -> torch.Tensor:
-    """SDS loss variant that picks the matching null-text for the
-    sampled timestep, since null-text is per-timestep.
+    """SDS loss with null-text and U-Net timestep sampled coherently.
 
-    Implementation note: ``sds_cfg_loss`` from ``losses.py`` takes a
-    single null-text embedding. Here we sample t first, look up the
-    matching null-text, and call sds_cfg_loss with that single embedding.
+    Critical: ``null_text_per_timestep[t_idx]`` and the timestep used
+    for the U-Net forward pass must be the SAME timestep — null-text
+    was optimized for a specific denoising-step index. This wrapper
+    samples ``t_idx ∈ [0, T)``, looks up null-text, AND derives the
+    actual training-timestep value ``t = scheduler_timesteps[t_idx]``,
+    passing both to ``sds_cfg_loss``. Sampling them independently
+    (the prior bug — see Bug #1 in the audit commit) breaks the
+    consistency: U-Net sees x_t at one noise level with null-text
+    optimized for a different noise level, producing garbage
+    eps_uncond.
     """
     device = image_latent.device
-    num_train_timesteps = scheduler.config.num_train_timesteps
     T = null_text_per_timestep.shape[0]
 
-    # Sample t but constrain to indices we have null-text for.
     if timestep_sampling == "uniform":
         t_idx = torch.randint(0, T, (1,), device=device, dtype=torch.long)
-    else:  # "importance"
+    else:  # "importance" — bias toward mid-timesteps
         u = torch.rand(1, device=device)
         t_idx = ((1 - torch.sqrt(1 - u)) * T).long().clamp_(0, T - 1)
 
-    null_text_for_t = null_text_per_timestep[t_idx.item()]  # [1, 77, D]
+    null_text_for_t = null_text_per_timestep[t_idx.item()]      # [1, 77, D]
+    t = scheduler_timesteps[t_idx.item()].view(1).to(device=device, dtype=torch.long)
 
     return sds_cfg_loss(
         projected,
         image_latent=image_latent,
         null_text_embedding=null_text_for_t,
+        t=t,
         cfg_scale=cfg_scale,
         unet=unet,
         scheduler=scheduler,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
-        timestep_sampling=timestep_sampling,
     )

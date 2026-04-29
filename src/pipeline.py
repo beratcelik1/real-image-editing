@@ -237,6 +237,9 @@ def edit_image(
     # 5. P2P + LocalBlend edit (extracted as a public function so callers
     #    with embeddings from any source — BLIP-derived, hand-written,
     #    alternative inversions — can reuse the same wiring).
+    #    Threading PEZ-1's null_text through so the editing loop's CFG
+    #    unconditional branch uses the optimized null-text per timestep
+    #    (faithful Mokady-style source reconstruction at edit time).
     print("[edit_image] Step 3/3: P2P + LocalBlend edit")
     edited = run_p2p_edit(
         image=image,
@@ -245,6 +248,7 @@ def edit_image(
         sd_components=sd_components,
         edit_config=edit_config,
         local_blend_config=local_blend_config,
+        null_text_per_timestep=null_text,
     )
 
     # 6. Save
@@ -257,6 +261,38 @@ def edit_image(
     return edited
 
 
+def prepare_source_inversion(
+    image: Image.Image,
+    source_embeddings: torch.Tensor,
+    sd_components: dict,
+    edit_config: EditConfig,
+) -> torch.Tensor:
+    """Compute z_T for a (image, source_embeddings) pair, returning the
+    inverted latent. Decoupled from :func:`run_p2p_edit` so sweep loops
+    can compute z_T once and reuse it across the inner cross_replace_steps
+    loop (Bug #6 fix).
+    """
+    tokenizer = sd_components["tokenizer"]
+    text_encoder = sd_components["text_encoder"]
+    unet = sd_components["unet"]
+    vae = sd_components["vae"]
+    scheduler = sd_components["scheduler"]
+    device = torch.device(edit_config.device)
+    dtype = _str_to_dtype(edit_config.dtype)
+
+    src = _ensure_batched(source_embeddings).to(device=device)
+    source_emb = _encode_continuous_prompt(src, text_encoder, tokenizer, dtype)
+    uncond_emb = get_uncond_embeddings(tokenizer, text_encoder, device)
+    image_latent = encode_image(image, vae, device).to(dtype=dtype)
+    z_T, _ = ddim_inversion(
+        image_latent, source_emb, uncond_emb,
+        unet, scheduler,
+        num_steps=edit_config.ddim.num_steps,
+        cfg_scale=edit_config.ddim.cfg_scale,
+    )
+    return z_T
+
+
 def run_p2p_edit(
     image: Image.Image,
     source_embeddings: torch.Tensor,
@@ -264,6 +300,8 @@ def run_p2p_edit(
     sd_components: dict,
     edit_config: EditConfig,
     local_blend_config: LocalBlendConfig,
+    null_text_per_timestep: list[torch.Tensor] | None = None,
+    cached_z_T: torch.Tensor | None = None,
 ) -> Image.Image:
     """Run a P2P + LocalBlend edit on *image* given source/target embeddings.
 
@@ -276,12 +314,19 @@ def run_p2p_edit(
       1. Run each [1, N, 768] embedding through CLIP's text encoder
          (wrapped with BOS/EOS/padding to 77 positions) to get the
          contextual hidden states SD's U-Net cross-attention consumes.
-      2. DDIM-invert the source under its contextual encoding.
+      2. DDIM-invert the source under its contextual encoding (or use
+         ``cached_z_T`` if provided).
       3. Per-position cosine alignment between source and target
          embeddings → matched / unmapped position lists.
       4. Set up :class:`CrossAttentionController` + optional
          :class:`LocalBlend`.
-      5. Run the editing denoising loop with a ``[source, target]`` batch.
+      5. Run the editing denoising loop with a ``[source, target]`` batch
+         using the optimized null-text-per-timestep (if provided) on the
+         unconditional CFG branch — this is what gives faithful source
+         reconstruction at edit time (the whole point of null-text
+         inversion). Without it, the source branch reconstructs the
+         source only approximately, contaminating P2P's source→target
+         attention injection.
       6. Decode the target half and return.
 
     Parameters
@@ -304,6 +349,19 @@ def run_p2p_edit(
         there are no unmapped target positions, LocalBlend is skipped
         and the controller behaves identically to the original P2P
         paper.
+    null_text_per_timestep
+        Optional per-timestep optimized null-text embeddings from PEZ-1.
+        Length should equal ``edit_config.ddim.num_steps``; the i-th
+        entry is used as the unconditional embedding at the i-th
+        denoising step. If None or length-mismatched, falls back to
+        the standard "" CLIP encoding (Bug #2 — without this, edits
+        lose Mokady-style faithful source reconstruction).
+    cached_z_T
+        Optional pre-computed inverted latent. When sweeping over
+        edit-time hyperparameters with the same source, callers can
+        compute z_T once via :func:`prepare_source_inversion` and pass
+        it here to avoid redoing DDIM inversion 27× per (image,
+        instruction) pair (Bug #6 fix).
 
     Returns
     -------
@@ -335,13 +393,38 @@ def run_p2p_edit(
     target_emb = _encode_continuous_prompt(tgt, text_encoder, tokenizer, dtype)
     uncond_emb = get_uncond_embeddings(tokenizer, text_encoder, device)
 
-    image_latent = encode_image(image, vae, device).to(dtype=dtype)
-    z_T, _ = ddim_inversion(
-        image_latent, source_emb, uncond_emb,
-        unet, scheduler,
-        num_steps=edit_config.ddim.num_steps,
-        cfg_scale=edit_config.ddim.cfg_scale,
-    )
+    if cached_z_T is None:
+        image_latent = encode_image(image, vae, device).to(dtype=dtype)
+        z_T, _ = ddim_inversion(
+            image_latent, source_emb, uncond_emb,
+            unet, scheduler,
+            num_steps=edit_config.ddim.num_steps,
+            cfg_scale=edit_config.ddim.cfg_scale,
+        )
+    else:
+        z_T = cached_z_T.to(device=device, dtype=dtype)
+
+    # Bug #2 fix: prepare per-step null-text for the editing loop.
+    # If null_text_per_timestep is provided and matches the number of
+    # denoising steps, we'll use null_text_per_timestep[i] at step i.
+    # Otherwise fall back to default uncond_emb (warning the user that
+    # source reconstruction quality will suffer).
+    nt_per_step: list[torch.Tensor] | None = None
+    if null_text_per_timestep is not None:
+        if len(null_text_per_timestep) == edit_config.ddim.num_steps:
+            nt_per_step = [
+                nt.detach().to(device=device, dtype=dtype)
+                for nt in null_text_per_timestep
+            ]
+        else:
+            print(
+                f"[run_p2p_edit] WARNING: null_text_per_timestep length "
+                f"{len(null_text_per_timestep)} != ddim.num_steps "
+                f"{edit_config.ddim.num_steps}. Falling back to default "
+                f"uncond at edit time; source reconstruction will be "
+                f"approximate. Re-run PEZ-1 with matching num_steps to "
+                f"recover faithful Mokady-style null-text inversion."
+            )
 
     matched, unmapped_target = align_pez_prompts(
         src.squeeze(0), tgt.squeeze(0),
@@ -388,6 +471,7 @@ def run_p2p_edit(
         cross_ctrl=cross_ctrl,
         cfg_scale=edit_config.ddim.cfg_scale,
         num_steps=edit_config.ddim.num_steps,
+        null_text_per_timestep=nt_per_step,
     )
     unregister_attention_control(unet)
 
@@ -446,6 +530,7 @@ def _run_editing_loop(
     cross_ctrl,
     cfg_scale: float,
     num_steps: int,
+    null_text_per_timestep: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Run the editing denoising loop with a [source, target] batch.
 
@@ -453,16 +538,29 @@ def _run_editing_loop(
     (uncond, source, uncond, target) batch with CFG, then advance the
     cross-attention controller's step counter (which also advances any
     attached LocalBlend).
+
+    If ``null_text_per_timestep`` is provided, the i-th entry replaces
+    ``uncond_emb`` at step i — this is the Mokady-style null-text
+    inversion (faithful source reconstruction at edit time). Without
+    it, the standard default-uncond fallback applies and source
+    reconstruction is only approximate.
     """
     scheduler.set_timesteps(num_steps)
     # Stack into batch [source, target]
     latent = torch.cat([z_T, z_T.clone()], dim=0)
 
-    for t in scheduler.timesteps:
+    for step_idx, t in enumerate(scheduler.timesteps):
+        # Pick the unconditional embedding for this step:
+        # null_text_per_timestep[step_idx] if available, else default uncond.
+        if null_text_per_timestep is not None:
+            ut = null_text_per_timestep[step_idx]
+        else:
+            ut = uncond_emb
+
         # CFG batch: [uncond_src, uncond_tgt, cond_src, cond_tgt]
         latent_in = torch.cat([latent, latent], dim=0)
         embed_in = torch.cat([
-            uncond_emb, uncond_emb,         # uncond for both
+            ut, ut,                          # uncond for both
             source_emb, target_emb,          # cond for source/target
         ], dim=0)
         with torch.no_grad():

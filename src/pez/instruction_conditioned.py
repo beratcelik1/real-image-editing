@@ -37,17 +37,22 @@ def _hash_pez2(
     pez_1_embeddings: torch.Tensor,
     config: Pez2Config,
 ) -> str:
+    """Cache key for PEZ-2: every config field that affects the result.
+
+    Bug #4 fix: previously omitted learning_rate and timestep_sampling.
+    """
     h = hashlib.sha256()
     h.update(image.tobytes())
     h.update(image.size[0].to_bytes(4, "little"))
     h.update(image.size[1].to_bytes(4, "little"))
     h.update(instruction.encode("utf-8"))
-    # Hash the source embedding tensor's bytes — small enough to be cheap.
     h.update(pez_1_embeddings.detach().cpu().contiguous().numpy().tobytes())
     cfg_str = (
         f"{config.source_loss_type}|cfg={config.cfg_scale}|"
+        f"ts_sampling={config.timestep_sampling}|"
         f"lam={config.lambda_instruction}|gam={config.gamma_anchor}|"
-        f"warm={config.warm_start}|steps={config.num_steps}|"
+        f"warm={config.warm_start}|"
+        f"steps={config.num_steps}|lr={config.learning_rate}|"
         f"seed={config.seed}|clip={config.clip_model}"
     )
     h.update(cfg_str.encode("utf-8"))
@@ -113,9 +118,18 @@ def pez_invert_with_instruction(
     # (used in L_instruction).
     instr_pooled = _encode_text_pooled(instruction, tokenizer, text_encoder, device)
 
-    # Stack null-text for t-sampled lookup
-    null_text_stacked = torch.stack(null_text_per_timestep, dim=0)  # [T, 1, 77, D]
+    # Stack null-text for t-sampled lookup. Move to device explicitly
+    # — null_text_per_timestep may have come from torch.load(map_location='cpu')
+    # so .to(device) here prevents a device-mismatch crash inside U-Net
+    # forward (Bug #3 fix).
+    null_text_stacked = torch.stack(
+        [nt.detach().to(device=device) for nt in null_text_per_timestep], dim=0,
+    )  # [T, 1, 77, D]
     T = null_text_stacked.shape[0]
+    # Cache scheduler.timesteps so we can map t_idx → actual timestep
+    # value for U-Net forward (Bug #1 fix — keeps null-text and t aligned).
+    scheduler.set_timesteps(T)
+    scheduler_timesteps = scheduler.timesteps.to(device=device)
 
     # Warm-start: identity copy of PEZ-1's continuous embeddings.
     # No vocabulary lookup — we're already in CLIP-input embedding space.
@@ -135,24 +149,30 @@ def pez_invert_with_instruction(
 
     # Build the joint loss closure
     def _joint_loss_fn(soft_prompt: torch.Tensor) -> torch.Tensor:
-        # L_source: SDS-CFG with t-sampled null-text
+        # L_source: SDS-CFG. Sample t_idx and look up BOTH the matching
+        # null-text AND the matching training-timestep value, then pass
+        # both to sds_cfg_loss so they stay coherent. Sampling t
+        # independently inside sds_cfg_loss (the prior bug) used null-text
+        # optimized for one timestep with U-Net at a different timestep,
+        # producing garbage eps_uncond (Bug #1).
         if config.timestep_sampling == "uniform":
             t_idx = torch.randint(0, T, (1,), device=device, dtype=torch.long)
         else:
             u = torch.rand(1, device=device)
             t_idx = ((1 - torch.sqrt(1 - u)) * T).long().clamp_(0, T - 1)
         null_text_for_t = null_text_stacked[t_idx.item()]
+        t = scheduler_timesteps[t_idx.item()].view(1).to(device=device, dtype=torch.long)
 
         l_source = sds_cfg_loss(
             soft_prompt,
             image_latent=image_latent,
             null_text_embedding=null_text_for_t,
+            t=t,
             cfg_scale=config.cfg_scale,
             unet=unet,
             scheduler=scheduler,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
-            timestep_sampling=config.timestep_sampling,
         )
 
         # L_instruction: text-text CLIP cosine

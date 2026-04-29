@@ -211,23 +211,31 @@ def clip_similarity_loss(
 
 
 def sds_cfg_loss(
-    soft_prompt: torch.Tensor,    # [1, N, D] continuous embedding
+    soft_prompt: torch.Tensor,              # [1, N, D] continuous embedding
     image_latent: torch.Tensor,             # [1, 4, H, W] VAE-encoded source
-    null_text_embedding: torch.Tensor,      # [1, 77, D] frozen null-text
+    null_text_embedding: torch.Tensor,      # [1, 77, D] frozen null-text at timestep t
+    t: torch.Tensor,                        # [1] long, the timestep used for U-Net
     cfg_scale: float,
     unet,                                   # diffusers UNet2DConditionModel
     scheduler,                              # DDIM scheduler with alphas_cumprod
     text_encoder,
     tokenizer,
-    timestep_sampling: str = "uniform",     # "uniform" or "importance"
 ) -> torch.Tensor:
     """CFG-aware Score Distillation Sampling surrogate of the
     reconstruction loss for the editing pipeline.
 
-    See RESEARCH_PROPOSAL.md §3.1 for the derivation. One pass each
-    through the U-Net under the prompt and under the null-text;
-    backprop through the prompt-conditional pass updates the soft
-    prompt.
+    See RESEARCH_PROPOSAL.md §3.1 for the derivation. Two U-Net forward
+    passes (cond + uncond); backprop through the cond pass updates the
+    soft prompt. The uncond pass is wrapped in ``torch.no_grad()`` since
+    null-text is frozen and grad to soft_prompt through it is exactly
+    zero — the autograd graph for that pass would just waste memory.
+
+    The caller is responsible for sampling ``t`` and looking up the
+    matching ``null_text_embedding``. Decoupling sampling from this
+    function makes it possible to use null-text-per-timestep
+    consistently: the caller picks t_idx, looks up
+    ``null_text_per_timestep[t_idx]``, derives ``t = scheduler.timesteps[t_idx]``,
+    and passes both — guaranteeing they're aligned.
     """
     device = soft_prompt.device
     dtype = unet.dtype
@@ -250,35 +258,21 @@ def sds_cfg_loss(
     )
     # last_hidden_state is [1, 77, D] — the encoder_hidden_states for U-Net.
 
-    # 2. Sample timestep t (uniform or importance-weighted) and noise.
-    num_train_timesteps = scheduler.config.num_train_timesteps
-    if timestep_sampling == "uniform":
-        t = torch.randint(
-            0, num_train_timesteps, (1,), device=device, dtype=torch.long,
-        )
-    elif timestep_sampling == "importance":
-        # Bias toward mid-timesteps where SDS signal is strongest.
-        # Triangular distribution centered at T/2.
-        u = torch.rand(1, device=device)
-        t_float = (1 - torch.sqrt(1 - u)) * num_train_timesteps
-        t = t_float.long().clamp_(0, num_train_timesteps - 1)
-    else:
-        raise ValueError(
-            f"Unknown timestep_sampling={timestep_sampling!r}; "
-            f"use 'uniform' or 'importance'."
-        )
-
+    # 2. Compute x_t under the caller-provided timestep.
     eps = torch.randn_like(image_latent)
     alpha_cumprod_t = scheduler.alphas_cumprod[t].to(device=device, dtype=dtype)
     sqrt_alpha = alpha_cumprod_t.sqrt()
     sqrt_one_minus_alpha = (1 - alpha_cumprod_t).sqrt()
-    x_t = sqrt_alpha * image_latent.to(dtype) + sqrt_one_minus_alpha * eps
+    x_t = sqrt_alpha * image_latent.to(device=device, dtype=dtype) + sqrt_one_minus_alpha * eps
 
-    # 3. CFG forward pass: two U-Net calls.
-    # ε_uncond uses null-text (frozen), ε_cond uses our prompt encoding.
-    eps_uncond = unet(
-        x_t, t, encoder_hidden_states=null_text_embedding.to(dtype),
-    ).sample
+    # 3. CFG forward pass: two U-Net calls. The unconditional pass is
+    # frozen (null-text is detached, x_t/eps don't depend on soft_prompt),
+    # so wrap in no_grad to skip building its autograd graph.
+    null_text_on_dev = null_text_embedding.to(device=device, dtype=dtype)
+    with torch.no_grad():
+        eps_uncond = unet(
+            x_t, t, encoder_hidden_states=null_text_on_dev,
+        ).sample
     eps_cond = unet(
         x_t, t, encoder_hidden_states=last_hidden_state,
     ).sample
