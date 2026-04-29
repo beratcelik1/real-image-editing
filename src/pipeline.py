@@ -44,6 +44,7 @@ from src.config import (
 )
 from src.pez.source_inversion import pez_invert_source
 from src.pez.instruction_conditioned import pez_invert_with_instruction
+from src.pez.losses import assemble_77_token_embedding, encode_through_text_model
 from src.splice.align import align_pez_prompts
 from attention_control.cross_attention import (
     CrossAttentionController,
@@ -214,7 +215,7 @@ def edit_image(
 
     # 3. PEZ-1: source-image inversion (alternating R=2)
     print("[edit_image] Step 1/3: PEZ-1 source inversion")
-    source_token_ids, null_text = pez_invert_source(
+    source_embeddings, null_text = pez_invert_source(
         image=image,
         config=pez_1_config,
         sd_components=sd_components,
@@ -224,23 +225,23 @@ def edit_image(
 
     # 4. PEZ-2: instruction-conditioned target generation
     print("[edit_image] Step 2/3: PEZ-2 instruction-conditioned generation")
-    target_token_ids = pez_invert_with_instruction(
+    target_embeddings = pez_invert_with_instruction(
         image=image,
         instruction=instruction,
-        pez_1_token_ids=source_token_ids,
+        pez_1_embeddings=source_embeddings,
         null_text_per_timestep=null_text,
         config=pez_2_config,
         sd_components=sd_components,
     )
 
     # 5. P2P + LocalBlend edit (extracted as a public function so callers
-    #    with token IDs from any source — BLIP captions, hand-written
-    #    prompts, alternative inversions — can reuse the same wiring).
+    #    with embeddings from any source — BLIP-derived, hand-written,
+    #    alternative inversions — can reuse the same wiring).
     print("[edit_image] Step 3/3: P2P + LocalBlend edit")
     edited = run_p2p_edit(
         image=image,
-        source_token_ids=source_token_ids,
-        target_token_ids=target_token_ids,
+        source_embeddings=source_embeddings,
+        target_embeddings=target_embeddings,
         sd_components=sd_components,
         edit_config=edit_config,
         local_blend_config=local_blend_config,
@@ -258,24 +259,26 @@ def edit_image(
 
 def run_p2p_edit(
     image: Image.Image,
-    source_token_ids: list[int],
-    target_token_ids: list[int],
+    source_embeddings: torch.Tensor,
+    target_embeddings: torch.Tensor,
     sd_components: dict,
     edit_config: EditConfig,
     local_blend_config: LocalBlendConfig,
 ) -> Image.Image:
-    """Run a P2P + LocalBlend edit on *image* given source/target token IDs.
+    """Run a P2P + LocalBlend edit on *image* given source/target embeddings.
 
     This is the editing tail of :func:`edit_image`, decoupled so callers
-    that already have token IDs (BLIP captions, hand-written prompts,
-    alternative inversion methods, sweep scripts iterating over
-    pre-computed PEZ-2 results, etc.) can reuse it without re-running
-    PEZ-1 / PEZ-2.
+    that already have continuous embeddings from any source (PEZ-1/2,
+    alternative inversions, sweep scripts iterating over pre-computed
+    PEZ-2 results, etc.) can reuse it without re-running PEZ-1 / PEZ-2.
 
     Pipeline:
-      1. Decode token IDs to strings; encode through CLIP text encoder.
-      2. DDIM-invert the source under its prompt.
-      3. LCS-align source/target token positions.
+      1. Run each [1, N, 768] embedding through CLIP's text encoder
+         (wrapped with BOS/EOS/padding to 77 positions) to get the
+         contextual hidden states SD's U-Net cross-attention consumes.
+      2. DDIM-invert the source under its contextual encoding.
+      3. Per-position cosine alignment between source and target
+         embeddings → matched / unmapped position lists.
       4. Set up :class:`CrossAttentionController` + optional
          :class:`LocalBlend`.
       5. Run the editing denoising loop with a ``[source, target]`` batch.
@@ -285,14 +288,17 @@ def run_p2p_edit(
     ----------
     image
         Source PIL image.
-    source_token_ids, target_token_ids
-        Discrete token IDs for the source/target prompts. Apply any
-        ``cross_replace_steps`` overrides via :func:`_apply_overrides_nested`
-        on ``edit_config`` *before* calling this function.
+    source_embeddings, target_embeddings : Tensor[1, N, 768] or [N, 768]
+        Continuous CLIP-input embeddings produced by PEZ-1 / PEZ-2
+        (or any compatible source). Apply any ``cross_replace_steps``
+        overrides via :func:`_apply_overrides_nested` on ``edit_config``
+        *before* calling this function.
     sd_components
         Dict ``{"unet", "vae", "text_encoder", "tokenizer", "scheduler"}``.
     edit_config
         Loaded :class:`EditConfig` with any overrides already applied.
+        The cosine threshold used for alignment is
+        ``edit_config.alignment_threshold``.
     local_blend_config
         Loaded :class:`LocalBlendConfig`. If ``.enabled`` is False or
         there are no unmapped target positions, LocalBlend is skipped
@@ -312,10 +318,12 @@ def run_p2p_edit(
     device = torch.device(edit_config.device)
     dtype = _str_to_dtype(edit_config.dtype)
 
-    source_str = tokenizer.decode(source_token_ids, skip_special_tokens=True)
-    target_str = tokenizer.decode(target_token_ids, skip_special_tokens=True)
-    source_emb = get_text_embeddings(source_str, tokenizer, text_encoder, device)
-    target_emb = get_text_embeddings(target_str, tokenizer, text_encoder, device)
+    # Normalize shapes: caller may hand us [N, D] or [1, N, D].
+    src = _ensure_batched(source_embeddings).to(device=device)
+    tgt = _ensure_batched(target_embeddings).to(device=device)
+
+    source_emb = _encode_continuous_prompt(src, text_encoder, tokenizer, dtype)
+    target_emb = _encode_continuous_prompt(tgt, text_encoder, tokenizer, dtype)
     uncond_emb = get_uncond_embeddings(tokenizer, text_encoder, device)
 
     image_latent = encode_image(image, vae, device).to(dtype=dtype)
@@ -326,17 +334,24 @@ def run_p2p_edit(
         cfg_scale=edit_config.ddim.cfg_scale,
     )
 
-    full_source_ids = tokenizer.encode(source_str)
-    full_target_ids = tokenizer.encode(target_str)
-    mapping, unmapped_target = align_pez_prompts(
-        full_source_ids, full_target_ids,
+    matched, unmapped_target = align_pez_prompts(
+        src.squeeze(0), tgt.squeeze(0),
+        threshold=edit_config.alignment_threshold,
         method=edit_config.alignment_method,
     )
+    # Convert matched-position list to {src: tgt} mapping for the
+    # CrossAttentionController. Warm-start gives same-position
+    # correspondence, so the mapping is the identity over matched.
+    # The position indices are 0-based over the [N, 768] sequence;
+    # CLIP wraps them with BOS at 0, so add 1 to land on the right
+    # 77-position contextual-encoding indices.
+    mapping = {i + 1: i + 1 for i in matched}
+    unmapped_in_77 = [i + 1 for i in unmapped_target]
 
     local_blend = None
-    if local_blend_config.enabled and unmapped_target:
+    if local_blend_config.enabled and unmapped_in_77:
         local_blend = LocalBlend(
-            target_token_indices=unmapped_target,
+            target_token_indices=unmapped_in_77,
             threshold=local_blend_config.threshold,
             base_resolution=local_blend_config.base_resolution,
             dilate_iters=local_blend_config.dilate_iters,
@@ -368,6 +383,43 @@ def run_p2p_edit(
     unregister_attention_control(unet)
 
     return decode_latent(edited_latent[1:2], vae)
+
+
+def _ensure_batched(emb: torch.Tensor) -> torch.Tensor:
+    """Promote [N, D] to [1, N, D]; pass [1, N, D] through unchanged."""
+    if emb.ndim == 2:
+        return emb.unsqueeze(0)
+    if emb.ndim == 3 and emb.shape[0] == 1:
+        return emb
+    raise ValueError(f"Expected [N, D] or [1, N, D]; got shape {tuple(emb.shape)}")
+
+
+def _encode_continuous_prompt(
+    soft_prompt: torch.Tensor,    # [1, N, D]
+    text_encoder,
+    tokenizer,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run a continuous PEZ embedding through CLIP's text model.
+
+    Wraps the [1, N, D] soft prompt with BOS/EOS/padding to 77
+    positions and runs the result through CLIP's text transformer
+    (bypassing the embedding lookup since we already have the input
+    embeddings). Returns [1, 77, D] contextual hidden states.
+    """
+    token_embedding = text_encoder.text_model.embeddings.token_embedding
+    full_embeds, eos_pos, pos_ids, attn_mask = assemble_77_token_embedding(
+        soft_prompt.to(dtype),
+        token_embedding=token_embedding,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    with torch.no_grad():
+        last_hidden, _ = encode_through_text_model(
+            full_embeds, pos_ids, attn_mask, eos_pos, text_encoder,
+        )
+    return last_hidden  # [1, 77, D]
 
 
 # ---------------------------------------------------------------------------

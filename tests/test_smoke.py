@@ -41,11 +41,14 @@ def test_no_torch_config_loading():
     assert p1.prompt_length > 0
     assert p1.loss_type in {"sds", "clip"}
     assert p1.num_rounds >= 1
+    # projection_every removed in v1; should not be present
+    assert not hasattr(p1, "projection_every")
 
     p2 = load_pez_2()
     assert p2.lambda_instruction >= 0
     assert p2.gamma_anchor >= 0
     assert p2.source_loss_type in {"sds", "clip"}
+    assert not hasattr(p2, "projection_every")
 
     lb = load_local_blend()
     assert 0 < lb.threshold < 1
@@ -54,48 +57,66 @@ def test_no_torch_config_loading():
     ed = load_edit()
     assert ed.sd_model
     assert 0 < ed.cross_attention.cross_replace_steps <= 1
-    assert ed.alignment_method in {"lcs", "semantic"}
+    assert ed.alignment_method == "cosine_threshold"
+    assert 0.0 < ed.alignment_threshold <= 1.0
 
 
-def test_no_torch_align_identity():
-    """Aligning identical token sequences gives identity mapping."""
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="torch not installed"
+)
+def test_align_identity():
+    """Aligning identical embeddings gives all positions matched."""
+    import torch
     from src.splice.align import align_pez_prompts
 
-    ids = [49406, 320, 1125, 539, 320, 5980, 49407]
-    mapping, unmapped = align_pez_prompts(ids, ids)
-    assert mapping == {i: i for i in range(len(ids))}
+    emb = torch.randn(7, 768)
+    matched, unmapped = align_pez_prompts(emb, emb.clone())
+    assert matched == list(range(7))
     assert unmapped == []
 
 
-def test_no_torch_align_substitution():
-    """Single-position substitution → unmapped at that position."""
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="torch not installed"
+)
+def test_align_substitution():
+    """Single-position drift → unmapped at that position."""
+    import torch
     from src.splice.align import align_pez_prompts
 
-    src = [0, 1, 2, 99, 4, 5]
-    tgt = [0, 1, 2, 88, 4, 5]
-    mapping, unmapped = align_pez_prompts(src, tgt)
+    emb = torch.randn(6, 768)
+    drifted = emb.clone()
+    drifted[3] = torch.randn(768) * 5  # large drift at position 3 only
+    matched, unmapped = align_pez_prompts(emb, drifted, threshold=0.95)
     assert 3 in unmapped
-    # All other positions should be mapped
     for pos in (0, 1, 2, 4, 5):
-        assert pos in mapping.values()
+        assert pos in matched
 
 
-def test_no_torch_align_additive():
-    """target = source + suffix → suffix positions are unmapped."""
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="torch not installed"
+)
+def test_align_unsupported_method():
+    """Unsupported alignment methods raise NotImplementedError."""
+    import torch
     from src.splice.align import align_pez_prompts
 
-    src = [0, 1, 2, 3]
-    tgt = [0, 1, 2, 3, 4, 5]
-    mapping, unmapped = align_pez_prompts(src, tgt)
-    assert unmapped == [4, 5]
-
-
-def test_no_torch_align_semantic_not_implemented():
-    """method='semantic' raises NotImplementedError pointing to Appendix B."""
-    from src.splice.align import align_pez_prompts
-
+    emb = torch.randn(3, 768)
     with pytest.raises(NotImplementedError, match="Appendix B"):
-        align_pez_prompts([0, 1, 2], [0, 1, 2], method="semantic")
+        align_pez_prompts(emb, emb, method="lcs")
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="torch not installed"
+)
+def test_align_shape_mismatch():
+    """Mismatched shapes raise ValueError mentioning warm-start."""
+    import torch
+    from src.splice.align import align_pez_prompts
+
+    src = torch.randn(5, 768)
+    tgt = torch.randn(7, 768)
+    with pytest.raises(ValueError, match="warm-start"):
+        align_pez_prompts(src, tgt)
 
 
 def test_no_torch_pez_module_structure():
@@ -201,22 +222,20 @@ def test_torch_local_blend_get_mask_step0_returns_none():
 
 @pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")
 def test_torch_pez_search_signature():
-    """pez_search accepts a loss_fn callable and returns (list[int], Tensor)."""
+    """pez_search returns the continuous soft prompt as a [1, N, D] tensor."""
     import torch
     from torch import nn
 
     from src.pez.search import pez_search
 
-    # Build a tiny embedding layer to test the projection mechanics
     vocab_size, dim = 100, 64
     emb = nn.Embedding(vocab_size, dim)
 
-    # A trivial loss that doesn't depend on the model — just minimizes
-    # the L2 norm of the projected prompt.
-    def trivial_loss(projected):
-        return (projected ** 2).sum()
+    # A trivial loss that doesn't depend on any model — minimize L2.
+    def trivial_loss(soft_prompt):
+        return (soft_prompt ** 2).sum()
 
-    token_ids, soft = pez_search(
+    soft = pez_search(
         loss_fn=trivial_loss,
         token_embedding=emb,
         prompt_length=4,
@@ -226,10 +245,17 @@ def test_torch_pez_search_signature():
         seed=42,
         device=torch.device("cpu"),
     )
-    assert isinstance(token_ids, list)
-    assert len(token_ids) == 4
-    assert all(isinstance(x, int) for x in token_ids)
+    assert isinstance(soft, torch.Tensor)
     assert soft.shape == (1, 4, 64)
+    # The optimization should have moved the soft prompt closer to 0
+    # (the trivial loss minimum).
+    assert soft.norm().item() < 100.0  # generous bound
+
+    # Sanity check: nn_project still works as a debug-time utility
+    from src.pez.search import nn_project
+    projected, ids = nn_project(soft, emb)
+    assert projected.shape == soft.shape
+    assert ids.shape == (1, 4)
 
 
 # ---------------------------------------------------------------------------

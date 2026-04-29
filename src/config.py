@@ -25,6 +25,8 @@ class Pez1Config:
     """PEZ-1 source-image inversion config (configs/pez_1.yaml).
 
     See RESEARCH_PROPOSAL.md §3.1 for the alternating R=2 algorithm.
+    Output is a continuous Tensor[prompt_length, 768] of CLIP-input
+    embeddings (no vocabulary projection).
     """
 
     # Loss formulation
@@ -40,7 +42,6 @@ class Pez1Config:
     learning_rate: float
     weight_decay: float
     batch_size: int
-    projection_every: int
 
     # Models
     clip_model: str
@@ -62,7 +63,8 @@ class Pez1Config:
 class Pez2Config:
     """PEZ-2 instruction-conditioned generation config (configs/pez_2.yaml).
 
-    See RESEARCH_PROPOSAL.md §3.2 for the three-term loss.
+    See RESEARCH_PROPOSAL.md §3.2 for the three-term loss. Output is
+    a continuous Tensor[prompt_length, 768] in the same shape as PEZ-1.
     """
 
     source_loss_type: str  # "sds" or "clip"; should match Pez1Config.loss_type
@@ -76,7 +78,6 @@ class Pez2Config:
 
     num_steps: int
     learning_rate: float
-    projection_every: int
 
     clip_model: str
 
@@ -130,7 +131,8 @@ class EditConfig:
     sd_model: str
     ddim: DDIMConfig
     cross_attention: CrossAttentionConfig
-    alignment_method: str  # "lcs" or "semantic"
+    alignment_method: str        # "cosine_threshold" only in v1
+    alignment_threshold: float   # τ in proposal §3.3 (cosine cutoff)
     device: str
     dtype: str
 

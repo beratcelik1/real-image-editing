@@ -1,13 +1,15 @@
 """PEZ loss functions: vanilla CLIP-cosine and CFG-aware SDS.
 
-Both losses take a projected soft-prompt tensor of shape
-``[1, prompt_length, dim]`` and return a scalar loss. Gradient
-propagates through the soft prompt via straight-through projection
-(see ``src/pez/search.py:nn_project``).
+Both losses take a continuous soft-prompt tensor of shape
+``[1, prompt_length, dim]`` and return a scalar loss. Gradient flows
+back to the soft prompt directly (continuous-PEZ — no straight-through
+vocabulary projection). See RESEARCH_PROPOSAL.md §3.1 for the loss
+formulations.
 
-See RESEARCH_PROPOSAL.md §3.1 for the loss formulations.
-See docs/pez_conditional/DESIGN_CHOICES.md for embedding-assembly
-choices (BOS/EOS/padding handling).
+The soft prompt is assembled into a 77-position CLIP-input sequence
+via ``assemble_77_token_embedding`` (BOS/EOS/padding wrapping); see
+``docs/pez_conditional/DESIGN_CHOICES.md`` for embedding-assembly
+choices.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ import torch.nn.functional as F
 
 
 def assemble_77_token_embedding(
-    soft_prompt: torch.Tensor,         # [1, N, D] (projected, with STE grad)
+    soft_prompt: torch.Tensor,         # [1, N, D] continuous embedding
     token_embedding: torch.nn.Embedding,
     bos_token_id: int,
     eos_token_id: int,
@@ -148,7 +150,7 @@ def _build_causal_attention_mask(bsz, seq_len, dtype, device):
 
 
 def clip_similarity_loss(
-    soft_prompt_projected: torch.Tensor,    # [1, N, D] from nn_project
+    soft_prompt: torch.Tensor,    # [1, N, D] continuous embedding
     target_image_features: torch.Tensor,    # [1, D] CLIP image embedding
     text_encoder,
     tokenizer,
@@ -161,14 +163,15 @@ def clip_similarity_loss(
 
     Parameters
     ----------
-    soft_prompt_projected
-        ``[1, N, D]`` — projected via ``nn_project`` (straight-through).
+    soft_prompt
+        ``[1, N, D]`` — continuous CLIP-input embeddings (the optimization
+        variable; gradient flows directly here).
     target_image_features
         ``[1, D]`` — CLIP image encoder's pooled+projected output for
         the source image. Computed once outside the loop.
     text_encoder
         transformers ``CLIPTextModel`` whose token_embedding layer
-        produced ``soft_prompt_projected``.
+        produced ``soft_prompt``.
     tokenizer
         Matching ``CLIPTokenizer`` (used for BOS/EOS/PAD ids).
     text_projection
@@ -182,7 +185,7 @@ def clip_similarity_loss(
     Scalar negative cosine similarity (lower = better match).
     """
     full_embeds, eos_position, position_ids, attention_mask = assemble_77_token_embedding(
-        soft_prompt_projected,
+        soft_prompt,
         token_embedding=text_encoder.text_model.embeddings.token_embedding,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -208,7 +211,7 @@ def clip_similarity_loss(
 
 
 def sds_cfg_loss(
-    soft_prompt_projected: torch.Tensor,    # [1, N, D] from nn_project
+    soft_prompt: torch.Tensor,    # [1, N, D] continuous embedding
     image_latent: torch.Tensor,             # [1, 4, H, W] VAE-encoded source
     null_text_embedding: torch.Tensor,      # [1, 77, D] frozen null-text
     cfg_scale: float,
@@ -226,14 +229,14 @@ def sds_cfg_loss(
     backprop through the prompt-conditional pass updates the soft
     prompt.
     """
-    device = soft_prompt_projected.device
+    device = soft_prompt.device
     dtype = unet.dtype
 
     # 1. Encode the soft prompt through CLIP text model to get the
     # 77×768 conditional encoding. This is the prompt embedding that
     # the U-Net's cross-attention will see.
     full_embeds, _, position_ids, attention_mask = assemble_77_token_embedding(
-        soft_prompt_projected,
+        soft_prompt,
         token_embedding=text_encoder.text_model.embeddings.token_embedding,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -241,7 +244,7 @@ def sds_cfg_loss(
     )
     # Cast embeds to model dtype for U-Net
     full_embeds = full_embeds.to(dtype=dtype)
-    eos_position = 1 + soft_prompt_projected.shape[1]
+    eos_position = 1 + soft_prompt.shape[1]
     last_hidden_state, _ = encode_through_text_model(
         full_embeds, position_ids, attention_mask, eos_position, text_encoder,
     )

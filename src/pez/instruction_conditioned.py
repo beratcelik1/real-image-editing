@@ -1,4 +1,4 @@
-"""PEZ-2 — instruction-conditioned target prompt generation.
+"""PEZ-2 — instruction-conditioned target embedding generation.
 
 Three-term loss (RESEARCH_PROPOSAL.md §3.2):
   L = L_source + lambda_instruction * L_instruction + gamma_anchor * L_anchor
@@ -7,7 +7,10 @@ Three-term loss (RESEARCH_PROPOSAL.md §3.2):
   PEZ-1's loss).
 - L_instruction: text-text CLIP cosine between the prompt and the
   instruction text.
-- L_anchor: L2 in soft-prompt space to PEZ-1's vocabulary embeddings.
+- L_anchor: L2 in soft-prompt space to PEZ-1's continuous embeddings.
+
+Output is a continuous Tensor[1, prompt_length, 768], same shape as
+PEZ-1's output. No vocabulary projection.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from src.pez.search import pez_search
 def _hash_pez2(
     image: Image.Image,
     instruction: str,
-    pez_1_token_ids: list[int],
+    pez_1_embeddings: torch.Tensor,
     config: Pez2Config,
 ) -> str:
     h = hashlib.sha256()
@@ -39,7 +42,8 @@ def _hash_pez2(
     h.update(image.size[0].to_bytes(4, "little"))
     h.update(image.size[1].to_bytes(4, "little"))
     h.update(instruction.encode("utf-8"))
-    h.update(",".join(str(i) for i in pez_1_token_ids).encode("utf-8"))
+    # Hash the source embedding tensor's bytes — small enough to be cheap.
+    h.update(pez_1_embeddings.detach().cpu().contiguous().numpy().tobytes())
     cfg_str = (
         f"{config.source_loss_type}|cfg={config.cfg_scale}|"
         f"lam={config.lambda_instruction}|gam={config.gamma_anchor}|"
@@ -53,11 +57,11 @@ def _hash_pez2(
 def pez_invert_with_instruction(
     image: Image.Image,
     instruction: str,
-    pez_1_token_ids: list[int],
+    pez_1_embeddings: torch.Tensor,
     null_text_per_timestep: list[torch.Tensor],
     config: Pez2Config,
     sd_components: dict,
-) -> list[int]:
+) -> torch.Tensor:
     """Run PEZ-2 with the three-term joint loss.
 
     Parameters
@@ -66,8 +70,8 @@ def pez_invert_with_instruction(
         Source image (used for the SDS term's image_latent).
     instruction
         User's natural-language edit instruction.
-    pez_1_token_ids
-        PEZ-1's discrete output tokens (the warm-start source).
+    pez_1_embeddings : Tensor[1, prompt_length, 768]
+        PEZ-1's continuous source embeddings (the warm-start source).
     null_text_per_timestep
         PEZ-1's optimized null-text (one per denoising timestep).
         Frozen during PEZ-2.
@@ -80,15 +84,16 @@ def pez_invert_with_instruction(
 
     Returns
     -------
-    target_token_ids : list[int]
-        Discrete target prompt token IDs.
+    target_embeddings : Tensor[1, prompt_length, 768]
+        Continuous target embeddings in CLIP-input space. Feed to
+        CLIP's text encoder for downstream P2P editing.
     """
     # Cache check
-    image_hash = _hash_pez2(image, instruction, pez_1_token_ids, config)
+    image_hash = _hash_pez2(image, instruction, pez_1_embeddings, config)
     cache_file = Path(config.cache_dir) / f"{image_hash}.pt"
     if config.use_cache and cache_file.exists():
         cached = torch.load(cache_file, map_location="cpu")
-        return cached["target_token_ids"]
+        return cached["target_embeddings"]
 
     device = torch.device(config.device)
     dtype = _str_to_dtype(config.dtype)
@@ -112,12 +117,16 @@ def pez_invert_with_instruction(
     null_text_stacked = torch.stack(null_text_per_timestep, dim=0)  # [T, 1, 77, D]
     T = null_text_stacked.shape[0]
 
-    # Warm-start from PEZ-1's vocab embeddings
+    # Warm-start: identity copy of PEZ-1's continuous embeddings.
+    # No vocabulary lookup — we're already in CLIP-input embedding space.
     if config.warm_start:
-        ids_tensor = torch.tensor([pez_1_token_ids], device=device)
-        soft_prompt_init = token_embedding(ids_tensor).detach().clone()
+        soft_prompt_init = pez_1_embeddings.detach().clone().to(device=device)
+        if soft_prompt_init.ndim == 2:
+            soft_prompt_init = soft_prompt_init.unsqueeze(0)
+        prompt_length = soft_prompt_init.shape[1]
     else:
         soft_prompt_init = None
+        prompt_length = pez_1_embeddings.shape[-2]
 
     # Capture the init for the L_anchor term
     soft_prompt_init_anchor = (
@@ -125,7 +134,7 @@ def pez_invert_with_instruction(
     )
 
     # Build the joint loss closure
-    def _joint_loss_fn(projected: torch.Tensor) -> torch.Tensor:
+    def _joint_loss_fn(soft_prompt: torch.Tensor) -> torch.Tensor:
         # L_source: SDS-CFG with t-sampled null-text
         if config.timestep_sampling == "uniform":
             t_idx = torch.randint(0, T, (1,), device=device, dtype=torch.long)
@@ -135,7 +144,7 @@ def pez_invert_with_instruction(
         null_text_for_t = null_text_stacked[t_idx.item()]
 
         l_source = sds_cfg_loss(
-            projected,
+            soft_prompt,
             image_latent=image_latent,
             null_text_embedding=null_text_for_t,
             cfg_scale=config.cfg_scale,
@@ -148,7 +157,7 @@ def pez_invert_with_instruction(
 
         # L_instruction: text-text CLIP cosine
         full_embeds, eos_pos, pos_ids, attn_mask = assemble_77_token_embedding(
-            projected,
+            soft_prompt,
             token_embedding=token_embedding,
             bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
@@ -164,10 +173,10 @@ def pez_invert_with_instruction(
         # L_anchor: L2 to warm-start init
         if soft_prompt_init_anchor is not None:
             l_anchor = (
-                (projected - soft_prompt_init_anchor.to(projected.dtype)) ** 2
+                (soft_prompt - soft_prompt_init_anchor.to(soft_prompt.dtype)) ** 2
             ).sum()
         else:
-            l_anchor = torch.tensor(0.0, device=device, dtype=projected.dtype)
+            l_anchor = torch.tensor(0.0, device=device, dtype=soft_prompt.dtype)
 
         return (
             l_source
@@ -176,24 +185,23 @@ def pez_invert_with_instruction(
         )
 
     print(f"[PEZ-2] instruction-conditioned optimization: {instruction!r}")
-    target_ids, _ = pez_search(
+    target_embeddings = pez_search(
         loss_fn=_joint_loss_fn,
         token_embedding=token_embedding,
-        prompt_length=len(pez_1_token_ids),
+        prompt_length=prompt_length,
         num_steps=config.num_steps,
         learning_rate=config.learning_rate,
         weight_decay=0.1,                  # standard
         seed=config.seed,
         device=device,
         initial_soft_prompt=soft_prompt_init,
-        projection_every=config.projection_every,
-    )
+    )  # [1, N, D]
 
     if config.use_cache:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"target_token_ids": target_ids}, cache_file)
+        torch.save({"target_embeddings": target_embeddings}, cache_file)
 
-    return target_ids
+    return target_embeddings
 
 
 # ---------------------------------------------------------------------------
