@@ -1253,7 +1253,9 @@ substitution, addition, and attribute change, measure:
 - **CLIP similarity** between PEZ-2's pooled output and a hand-crafted
   ground-truth target prompt for each test case.
 - **(λ_instruction, γ_anchor) ablation**: sweep `λ_instruction ∈ {0.5,
-  1.0, 2.0, 5.0}` and `γ_anchor ∈ {0.01, 0.1, 1.0}`. Report
+  1.0, 2.0}` and `γ_anchor ∈ {1.0, 0.1, 0.01}` — a 3×3 grid. Drops
+  λ=5.0 (the most aggressive end where alignment tends to break,
+  not informative beyond confirming the failure mode). Report
   performance across the grid; identify recommended operating points.
 
 Three reference Knob-1 operating points to use across downstream
@@ -1368,11 +1370,15 @@ setting), without committing to Knob 2 as a contribution axis.
 **Sweep design.**
 
 For each of 5 representative (image, instruction) pairs in the test
-set, evaluate the **4 × 3 × 3 = 36 setting grid**:
+set, evaluate the **3 × 3 × 3 = 27 setting grid**:
 
-- `λ_instruction ∈ {0.5, 1.0, 2.0, 5.0}` (Knob 1.a, primary axis)
+- `λ_instruction ∈ {0.5, 1.0, 2.0}` (Knob 1.a, primary axis)
 - `γ_anchor ∈ {1.0, 0.1, 0.01}` (Knob 1.b, primary axis)
 - `cross_replace_steps ∈ {0.8, 0.5, 0.3}` (Knob 2, secondary axis)
+
+(λ=5.0 from the §4.2 sweep is dropped here — it sits in the
+alignment-broken failure region and isn't informative for visualizing
+the operating envelope.)
 
 **Visualization is (λ, γ)-centric.** Heatmaps and image grids use λ
 and γ as their two axes; cross_replace_steps appears as a third
@@ -1395,13 +1401,16 @@ dimension via:
   baseline" scan view.
 
 **Cost per (image, instruction) pair:**
-- 12 PEZ-2 runs × ~10 min = ~2 h
-- 36 edits × ~2 min = ~1.2 h
-- Total: ~3.2 h per pair
+- 9 PEZ-2 runs × ~5 min = ~45 min (with `num_steps: 300` cap and
+  `pez_search`'s movement-based adaptive early stopping; some
+  settings converge well before the cap)
+- 27 edits × ~2 min = ~54 min
+- Total: ~1.5-2 h per pair
 
-For 5 representative pairs: ~16 h of GPU time. Cost-aware ordering
-(outer loop over (λ, γ), inner over cross_replace_steps) keeps PEZ-2
-amortized — each PEZ-2 output is reused across all 3 Knob-2 values.
+For 5 representative pairs: ~8-10 h of GPU time on a single A100.
+Cost-aware ordering (outer loop over (λ, γ), inner over
+cross_replace_steps) keeps PEZ-2 amortized — each PEZ-2 output is
+reused across all 3 Knob-2 values.
 
 For 5 representative pairs: ~4 hours of GPU time. Scales linearly
 with the size of the representative set.

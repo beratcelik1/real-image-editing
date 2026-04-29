@@ -30,8 +30,12 @@ gamma_anchor: 0.1             # too low → per-position drift breaks
 
 # ─── Optimization ────────────────────────────────────────────────
 # PEZ-2 is faster than PEZ-1 because warm-starting refines a near-
-# correct solution.
-num_steps: 500
+# correct solution. num_steps is a *cap* — pez_search's adaptive
+# early stopping (movement-based; see src/pez/search.py) terminates
+# sooner when the soft prompt converges. RESEARCH_PROPOSAL.md §3.2
+# allows 300-800; we set the cap conservatively to bound worst-case
+# cost in the (λ, γ) sweep.
+num_steps: 300
 learning_rate: 0.05           # lower than PEZ-1 since we're refining
 # (No projection_every: continuous PEZ doesn't snap to vocabulary.)
 

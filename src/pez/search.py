@@ -25,6 +25,65 @@ import torch
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------------
+# Adaptive early stopping
+# ---------------------------------------------------------------------------
+#
+# The optimization loop terminates before `num_steps` if the optimization
+# variable's relative L2 movement over a sliding window falls below a
+# threshold. Movement-based (rather than loss-based) because SDS-CFG loss
+# is dominated by MSE noise from random t/ε sampling — even at convergence
+# the loss value is nowhere near zero, and noise drowns out the convergence
+# signal. The variable's L2 trajectory is the cleaner signal: once it
+# stops moving meaningfully, we've converged.
+#
+# Hardcoded defaults rather than config knobs to keep the convergence
+# criterion outside the user's tuning surface (cf. RESEARCH_PROPOSAL.md
+# §3.1 on PEZ-2's weight_decay being similarly hardcoded).
+
+_EARLY_STOP_MIN_STEPS = 100         # never stop before this many steps
+_EARLY_STOP_CHECK_INTERVAL = 20     # check movement every k steps
+_EARLY_STOP_REL_THRESHOLD = 1e-3    # relative L2 movement below this → stop
+
+
+def _run_loop_with_early_stop(
+    optimizer: torch.optim.Optimizer,
+    loss_fn_eval: Callable[[], torch.Tensor],
+    var: torch.Tensor,                 # the optimization variable, for movement tracking
+    num_steps: int,
+) -> None:
+    """Run AdamW optimization with movement-based adaptive early stopping.
+
+    `loss_fn_eval` is a 0-arg closure that computes and returns the loss
+    (so callers can wrap soft_prompt = anchor + Δ or pass soft_prompt
+    directly). `var` is the parameter whose relative L2 movement we
+    monitor for the early-stop criterion.
+    """
+    prev_check = var.detach().clone()
+    for step in range(num_steps):
+        loss = loss_fn_eval()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if (
+            step >= _EARLY_STOP_MIN_STEPS
+            and (step + 1) % _EARLY_STOP_CHECK_INTERVAL == 0
+        ):
+            with torch.no_grad():
+                cur = var.detach()
+                rel_move = (cur - prev_check).norm() / (cur.norm() + 1e-8)
+            if rel_move.item() < _EARLY_STOP_REL_THRESHOLD:
+                print(
+                    f"[pez_search] early stop at step {step+1}/{num_steps} "
+                    f"(rel L2 movement {rel_move.item():.2e} < "
+                    f"{_EARLY_STOP_REL_THRESHOLD:.0e} over last "
+                    f"{_EARLY_STOP_CHECK_INTERVAL} steps)"
+                )
+                return
+            prev_check = cur.clone()
+
+
 def nn_project(
     curr_embeds: torch.Tensor,
     embedding_layer: torch.nn.Embedding,
@@ -95,7 +154,13 @@ def pez_search(
     prompt_length
         N — the number of soft-prompt positions to optimize.
     num_steps
-        Number of gradient steps.
+        Maximum number of gradient steps. The optimization terminates
+        early if the optimization variable's relative L2 movement
+        over a sliding window falls below threshold (movement-based
+        adaptive early stop — see ``_run_loop_with_early_stop``).
+        Movement-based rather than loss-based because SDS-CFG loss is
+        dominated by sampling noise. Defaults are hardcoded outside
+        the user's tuning surface.
     learning_rate, weight_decay
         AdamW hyperparameters. ``weight_decay`` is applied to whichever
         tensor is the optimization variable — soft_prompt directly
@@ -156,11 +221,12 @@ def pez_search(
         optimizer = torch.optim.AdamW(
             [delta], lr=learning_rate, weight_decay=weight_decay
         )
-        for _ in range(num_steps):
-            loss = loss_fn(anchor + delta)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        _run_loop_with_early_stop(
+            optimizer=optimizer,
+            loss_fn_eval=lambda: loss_fn(anchor + delta),
+            var=delta,
+            num_steps=num_steps,
+        )
         return (anchor + delta).detach()
 
     # Non-anchored path: optimize soft_prompt directly.
@@ -187,11 +253,10 @@ def pez_search(
     optimizer = torch.optim.AdamW(
         [soft_prompt], lr=learning_rate, weight_decay=weight_decay
     )
-
-    for _ in range(num_steps):
-        loss = loss_fn(soft_prompt)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
+    _run_loop_with_early_stop(
+        optimizer=optimizer,
+        loss_fn_eval=lambda: loss_fn(soft_prompt),
+        var=soft_prompt,
+        num_steps=num_steps,
+    )
     return soft_prompt.detach()
