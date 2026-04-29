@@ -17,38 +17,66 @@ def _patch_hf_chat_template_404() -> None:
     the catch, so it escapes to the user as a fatal error even though
     the model is fine.
 
-    Patch ``huggingface_hub.utils._pagination.paginate`` to silently
-    return empty for any URL containing ``additional_chat_templates``,
-    making the chat-template lookup return [] and letting the load
-    proceed. Idempotent; safe to call multiple times.
+    Patch at TWO layers:
+      1. ``huggingface_hub.hf_api.HfApi.list_repo_tree`` — wrap the
+         generator so any 404 on ``additional_chat_templates`` becomes
+         an empty iterator. This is the most direct intercept.
+      2. ``huggingface_hub.utils._pagination.paginate`` — same idea but
+         at a layer below. Defense-in-depth in case transformers'
+         import order or the underlying call path changes.
+
+    Idempotent; safe to call multiple times.
     """
+    # Layer 1: patch list_repo_tree (the function transformers calls).
+    try:
+        from huggingface_hub import hf_api
+    except ImportError:
+        return
+
+    if not getattr(hf_api, "_chat_template_404_patched", False):
+        _orig_list_repo_tree = hf_api.HfApi.list_repo_tree
+
+        def _patched_list_repo_tree(self, repo_id, path_in_repo=None, **kwargs):
+            try:
+                yield from _orig_list_repo_tree(
+                    self, repo_id, path_in_repo=path_in_repo, **kwargs,
+                )
+            except Exception:
+                if (
+                    isinstance(path_in_repo, str)
+                    and "additional_chat_templates" in path_in_repo
+                ):
+                    return  # silently empty
+                raise
+
+        hf_api.HfApi.list_repo_tree = _patched_list_repo_tree
+        hf_api._chat_template_404_patched = True
+
+    # Layer 2: patch paginate (the function called by list_repo_tree).
     try:
         from huggingface_hub.utils import _pagination
     except ImportError:
-        return  # very old huggingface_hub; nothing to patch
+        return
 
-    if getattr(_pagination, "_chat_template_404_patched", False):
-        return  # already patched
+    if not getattr(_pagination, "_chat_template_404_patched", False):
+        _orig_paginate = _pagination.paginate
 
-    _orig_paginate = _pagination.paginate
+        def _patched_paginate(path, params=None, headers=None):
+            try:
+                yield from _orig_paginate(path, params=params, headers=headers)
+            except Exception:
+                if isinstance(path, str) and "additional_chat_templates" in path:
+                    return  # silently empty
+                raise
 
-    def _patched_paginate(path, params=None, headers=None):
-        try:
-            yield from _orig_paginate(path, params=params, headers=headers)
-        except Exception:
-            if isinstance(path, str) and "additional_chat_templates" in path:
-                # CLIP and other non-LLM tokenizers don't have chat
-                # templates; the 404 is expected. Return empty.
-                return
-            raise
-
-    _pagination.paginate = _patched_paginate
-    _pagination._chat_template_404_patched = True
+        _pagination.paginate = _patched_paginate
+        _pagination._chat_template_404_patched = True
 
 
 # Apply the patch BEFORE any transformers import — transformers reads
-# huggingface_hub.utils._pagination.paginate at import time in some
-# versions. So this needs to run before `from transformers import ...`.
+# huggingface_hub.utils._pagination.paginate / hf_api.list_repo_tree at
+# import time in some versions. So this needs to run before
+# `from transformers import ...`.
 _patch_hf_chat_template_404()
 
 
