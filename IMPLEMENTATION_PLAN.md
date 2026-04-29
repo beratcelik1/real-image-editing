@@ -404,7 +404,27 @@ to absorb everything. Investigate:
 
 **File to create:** `src/pez/instruction_conditioned.py`
 
-**Read first:** Section 3.2 of the research proposal.
+**Read first:** Section 3.0 (edit modes) and Section 3.2 of the
+research proposal.
+
+### 4.0 Edit-mode scope for v1
+
+The research proposal defines three rule-based edit modes (§3.0):
+**REPLACE**, **ADD**, **EXPLICIT_REPLACE**. **v1 implements only
+REPLACE.** ADD and EXPLICIT_REPLACE are future work (R5/R6 in the
+proposal).
+
+Implementation guard rails for v1:
+- `EditConfig` carries a `mode: str` field. Only `"replace"` is
+  accepted; `"add"` and `"explicit_replace"` raise
+  `NotImplementedError` with a pointer to RESEARCH_PROPOSAL.md §3.0.
+- `prompt_length` in `pez_1.yaml` is maxed (default 15). REPLACE
+  mode never reserves free slots — every position is source-detail
+  capacity. ADD mode (future) will allocate `prompt_length_extra`
+  on top.
+- `pez_invert_with_instruction` operates as REPLACE-mode by default:
+  all N positions of `pez_1_embeddings` are unfrozen and used as the
+  warm-start; the 3-term joint loss optimizes them jointly.
 
 PEZ-2 reuses the same loss-pluggable `pez_search` from Step 3, but
 with a three-term loss (source-preservation + instruction-following +
@@ -848,15 +868,25 @@ These should all pass before considering the basic pipeline complete.
 
 ## 10. After this plan
 
-Once the basic pipeline works end-to-end, the next plans (separate
-documents, not yet written) cover:
+Once the REPLACE-mode pipeline works end-to-end, the next plans
+(separate documents, not yet written) cover:
 
-- **Refinement plan**: bounded continuous Δ refinement on PEZ-1 and
-  PEZ-2 outputs (`||Δ|| ≤ ε`), characterizing the fidelity vs.
-  position-stability Pareto frontier (R3 in the proposal).
-- **Evaluation plan**: implementing footprint concentration, edit
-  quality metrics, ablation infrastructure (R4 in the proposal).
-- **Notebooks plan**: R1, R2, R3, R4 ablation notebooks running the
+- **ADD-mode plan**: variable-length PEZ-2 with K free padding-init
+  slots so additive edits land in unanchored positions instead of
+  displacing source content. Adds `prompt_length_extra: int` to
+  `Pez2Config`; extends `pez_invert_with_instruction` to construct
+  an N+K soft prompt with L_anchor only on the first N. Adds
+  `mode: "add"` validation in `EditConfig`. (R5 in the proposal §7.)
+- **EXPLICIT_REPLACE-mode plan**: cosine-localized constrained
+  PEZ-2. User supplies `(source_word, target_word)`; system finds
+  the position whose embedding is closest to the source word's CLIP
+  encoding and runs PEZ-2 with all other positions frozen. Extends
+  `pez_search` with a `frozen_positions: set[int]` argument; adds
+  `mode: "explicit_replace"` validation. (R6 in the proposal §7.)
+- **Evaluation plan**: implementing edit-quality metrics, ablation
+  infrastructure, the (λ, γ) × (cross_replace_steps) two-knob grid
+  (R4 in the proposal).
+- **Notebooks plan**: R1, R2, R4 ablation notebooks running the
   full experimental sweep.
 
 Each layers cleanly on top of the basic pipeline without modifying

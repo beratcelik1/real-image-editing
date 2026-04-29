@@ -133,6 +133,9 @@ class EditConfig:
     cross_attention: CrossAttentionConfig
     alignment_method: str        # "cosine_threshold" only in v1
     alignment_threshold: float   # τ in proposal §3.3 (cosine cutoff)
+    mode: str                    # "replace" only in v1
+                                 # "add" / "explicit_replace" → NotImplementedError
+                                 # See RESEARCH_PROPOSAL.md §3.0.
     device: str
     dtype: str
 

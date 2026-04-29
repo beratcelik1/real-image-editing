@@ -59,6 +59,10 @@ def test_no_torch_config_loading():
     assert 0 < ed.cross_attention.cross_replace_steps <= 1
     assert ed.alignment_method == "cosine_threshold"
     assert 0.0 < ed.alignment_threshold <= 1.0
+    assert ed.mode == "replace", (
+        "v1 default and only-supported mode is 'replace'. "
+        "ADD and EXPLICIT_REPLACE are future modes (RESEARCH_PROPOSAL.md §3.0)."
+    )
 
 
 @pytest.mark.skipif(
@@ -103,6 +107,35 @@ def test_align_unsupported_method():
     emb = torch.randn(3, 768)
     with pytest.raises(NotImplementedError, match="Appendix B"):
         align_pez_prompts(emb, emb, method="lcs")
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="torch not installed"
+)
+def test_run_p2p_edit_rejects_unsupported_modes():
+    """run_p2p_edit raises NotImplementedError for non-REPLACE modes."""
+    import torch
+    from dataclasses import replace as dc_replace
+    from src.config import load_edit
+    from src.pipeline import run_p2p_edit
+
+    edit_cfg = load_edit()
+    # Synthesize a minimal valid call shape; the guard short-circuits
+    # before any heavy machinery runs, so we don't need real sd_components.
+    src_emb = torch.randn(1, 4, 768)
+    tgt_emb = torch.randn(1, 4, 768)
+
+    for bad_mode in ("add", "explicit_replace"):
+        cfg = dc_replace(edit_cfg, mode=bad_mode)
+        with pytest.raises(NotImplementedError, match="not implemented in v1"):
+            run_p2p_edit(
+                image=None,                 # never read; guard fires first
+                source_embeddings=src_emb,
+                target_embeddings=tgt_emb,
+                sd_components={},           # never read
+                edit_config=cfg,
+                local_blend_config=None,    # never read
+            )
 
 
 @pytest.mark.skipif(

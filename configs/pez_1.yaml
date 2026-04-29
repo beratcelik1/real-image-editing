@@ -32,6 +32,13 @@ prompt_length: 15             # N positions in [N, 768]. Larger N →
                               # more detail capacity (see proposal
                               # §3.2 detail-richness). Recommended
                               # 12-20.
+                              #
+                              # REPLACE-mode (v1) maxes this — every
+                              # position is source-detail capacity,
+                              # no slot reservation. ADD-mode (future)
+                              # will allocate Pez2Config.prompt_length_extra
+                              # on top of this for free padding-init
+                              # slots; PEZ-1's N stays the same.
 
 # ─── Optimization ────────────────────────────────────────────────
 num_steps: 1500               # PEZ optimization steps. More for

@@ -34,6 +34,25 @@ cross_attention:
   cross_replace_steps: 0.8
   layer_indices: null         # null = all cross-attention layers
 
+# Edit mode (RESEARCH_PROPOSAL.md §3.0). Three rule-based modes; v1
+# implements only REPLACE. ADD and EXPLICIT_REPLACE raise
+# NotImplementedError with a pointer to the proposal.
+#
+#   "replace"           — user input: target descriptor (e.g. "cat",
+#                         "brown fur"). PEZ-2 drifts one or more
+#                         existing positions toward the target.
+#                         All N positions unfrozen; max prompt_length.
+#                         Implemented in v1.
+#   "add"               — user input: object noun (e.g. "bowtie").
+#                         PEZ-2 allocates K extra free slots warm-
+#                         started from padding tokens; the new
+#                         content lands there. Future (R5).
+#   "explicit_replace"  — user input: (source_word, target_word) pair.
+#                         System cosine-localizes the source word to
+#                         a PEZ-1 position and drifts only that one.
+#                         Future (R6).
+mode: replace
+
 # Per-position alignment between PEZ-1 and PEZ-2 continuous embeddings.
 # Warm-start gives source/target identical length and per-position
 # correspondence by construction; alignment reduces to a per-position

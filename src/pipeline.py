@@ -310,6 +310,15 @@ def run_p2p_edit(
     edited_image : PIL.Image.Image
         The edited target image.
     """
+    if edit_config.mode != "replace":
+        raise NotImplementedError(
+            f"Edit mode {edit_config.mode!r} is not implemented in v1. "
+            "Only 'replace' is currently supported. See "
+            "RESEARCH_PROPOSAL.md §3.0 for the full mode taxonomy and "
+            "§7 (Phases R5/R6) for the planned ADD and EXPLICIT_REPLACE "
+            "implementations."
+        )
+
     tokenizer = sd_components["tokenizer"]
     text_encoder = sd_components["text_encoder"]
     unet = sd_components["unet"]

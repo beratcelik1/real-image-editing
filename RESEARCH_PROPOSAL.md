@@ -391,7 +391,98 @@ And one summary subsection:
 - **3.6**: Computational requirements
 - **3.7**: End-to-end pipeline recipe
 
-Each maps to one or more of the sub-claims in Section 2.
+Section 3.0 below lays out the **three rule-based edit modes** that
+gate which mechanism in §3.1–§3.7 the system actually runs. Mode 1
+(REPLACE) is the v1 implementation target; modes 2 (ADD) and 3
+(EXPLICIT_REPLACE) are future work, mechanically sketched here so the
+v1 design doesn't paint itself into a corner.
+
+Each subsection maps to one or more of the sub-claims in Section 2.
+
+### 3.0 Edit modes (rule-based, user-supplied)
+
+The system exposes three modes. The user picks a mode explicitly via
+a config flag (`EditConfig.mode`); the system does **not** auto-detect
+edit type from the instruction text. This is a deliberate trade-off
+against an LLM- or heuristic-classifier: CLIP can't reliably parse
+"is this an addition or a substitution?" and the joint loss alone is
+brittle on ambiguous cases (see Section 8a). Putting the mode in the
+user's hands eliminates a class of "did the system guess my intent?"
+failures.
+
+| Mode | User input | What it does | Status |
+|---|---|---|---|
+| **REPLACE** | A target descriptor: `"cat"`, `"brown fur"`, `"old"`, `"smiling"`. | Drift one or more positions of PEZ-1's source embeddings to encode the target. Optimizer (3-term joint loss) decides *which* positions move. Covers substitution and attribute change in §8a's taxonomy. | **v1** |
+| **ADD** | An object/accessory noun: `"bowtie"`, `"sunglasses"`, `"snow on the ground"`. | A new object renders in a localized region of the source; nothing else changes. | Future |
+| **EXPLICIT_REPLACE** | A source-target pair: `"dog" → "cat"`, `"leash" → "rope"`. | Same as REPLACE in spirit, but the user pre-localizes which content they want changed by naming the source word. The system finds the matching position via cosine and drifts only that one. | Future |
+
+The three modes share **the same PEZ-1 + P2P + LocalBlend pipeline**
+described in §3.1, §3.3, and Appendix A. They differ only in PEZ-2's
+optimization setup (which positions are unfrozen, and whether
+prompt_length is extended). PEZ-1 is mode-agnostic.
+
+#### REPLACE (v1)
+
+- **Input.** A descriptor of desired post-edit content (not an
+  imperative — "cat" or "a sleeping cat", not "change the dog to a
+  cat"). The descriptor's CLIP-text-encoder pooled vector is fed to
+  PEZ-2's `L_instr` term.
+- **PEZ-2 setup.** All N positions of `pez_1_embeddings` are unfrozen
+  and used as the warm-start. The 3-term joint loss (§3.2) runs as
+  specified.
+- **`prompt_length`.** **Maximize N** (project default: 15). REPLACE
+  mode never needs free slots — it works by drift, not extension —
+  so every position is source-detail capacity. The proposal's
+  detail-richness argument (§3.2) is fully active in this mode.
+- **Failure modes.** If the source has multiple subjects or the
+  target word is far from any PEZ-1 position in CLIP space, the
+  joint loss may fail to localize the edit cleanly. EXPLICIT_REPLACE
+  is the principled fallback for those cases (future).
+
+#### ADD (future)
+
+- **Input.** A noun describing the object to add.
+- **PEZ-2 setup.** Variable-length: `prompt_length_pez_2 = N + K`.
+  The first N positions are warm-started from `pez_1_embeddings` and
+  anchored normally. The last K positions are warm-started from CLIP
+  padding-token embeddings and have **no L_anchor pull**. The new
+  content lands in the K free slots; the original N stay near PEZ-1.
+- **Why this works.** Without free slots (REPLACE-style), an additive
+  instruction has nowhere natural to land — the optimizer must
+  displace existing source content to make room, sacrificing detail.
+  Free slots with zero anchor pull are *cheaper* to modify than
+  anchored slots (they have no L_source pull either, since padding
+  tokens contribute minimally to reconstruction), so the optimizer
+  routes additive content there by gradient.
+- **Alignment.** Per-position cosine threshold over the first N
+  positions identifies any incidental drift; the last K positions
+  are unmapped by construction (initialized to padding, drifted to
+  encode the new content). LocalBlend's `target_token_indices` is
+  the K positions plus any drifted positions in the first N.
+
+#### EXPLICIT_REPLACE (future)
+
+- **Input.** A source-target pair `(source_word, target_word)`.
+- **Localization.** Encode `source_word` through CLIP's text encoder
+  → 768-dim vector `e_src`. For each position `i` in
+  `pez_1_embeddings`, compute `cos_sim(e_src, pez_1_embeddings[i])`.
+  Pick the position(s) with highest similarity (top-1 by default;
+  top-k for repeated subjects).
+- **PEZ-2 setup.** All positions frozen (`requires_grad=False`)
+  *except* the localized one. L_instr targets `target_word`'s CLIP
+  encoding. L_source and L_anchor still apply (with anchor weight
+  perhaps higher than REPLACE since we trust the user's localization
+  more than the optimizer's discovery).
+- **Why this is more reliable than REPLACE.** When the user knows
+  exactly what's in the source and what they want it to become, an
+  explicit pair eliminates the "which position should drift?"
+  question that REPLACE's joint loss has to answer implicitly.
+- **Trade-off vs. REPLACE.** Loses REPLACE's serendipitous detail-
+  discovery (the "PEZ-2 finds bombay cat for a black husky"
+  property from §3.2) — explicit replacement honors only the
+  literal target word, not the closest source-matched specialization.
+  Use REPLACE when you want detail richness; use EXPLICIT_REPLACE
+  when you want reliability and explicit control.
 
 ### 3.1 PEZ on the source image (sub-claim 1)
 
@@ -583,9 +674,15 @@ prompt.
 
 ### 3.2 PEZ-2: instruction-conditioned target generation (sub-claim 2)
 
+This subsection describes PEZ-2 as run in **REPLACE mode** (the v1
+implementation target — see §3.0). The same machinery underlies ADD
+and EXPLICIT_REPLACE; what changes per mode is which positions are
+unfrozen during optimization and whether `prompt_length` is extended
+beyond N. See §3.0 for the per-mode setup.
+
 **What it does.** Runs PEZ a second time with two simultaneous CLIP
-similarity targets — the source image and the user's instruction text
-— producing a target prompt that satisfies both.
+similarity targets — the source image and the user's target descriptor
+— producing target embeddings that satisfy both.
 
 **The loss.** Three terms with different roles. The source-preservation
 term mirrors PEZ-1's reconstruction-aware loss (CFG-aware SDS with
@@ -1569,6 +1666,57 @@ Estimated time: 3–4 weeks including writeup iteration.
 A reasonable milestone cadence: R1 done by week 1, R2 by week 3,
 R4 by weeks 4-7.
 
+---
+
+### Future phases — modes ADD and EXPLICIT_REPLACE
+
+The v1 milestones above implement only the REPLACE mode (see §3.0).
+The other two modes are future work, mechanically scoped here so the
+v1 architecture doesn't preclude them.
+
+#### Phase R5 — ADD mode (variable-length PEZ-2)
+
+**Goal.** Extend PEZ-2 with K extra free slots warm-started from
+padding-token embeddings (no L_anchor pull on those slots), so
+additive instructions like `"add a bowtie"` land in the free slots
+instead of displacing source content.
+
+**Files to modify:**
+- `Pez2Config` gets `prompt_length_extra: int = 0` (K). REPLACE mode
+  uses K=0; ADD mode uses K ∈ {2, 3, 4} typically.
+- `pez_invert_with_instruction` constructs a soft prompt of length
+  N+K, warm-starts the first N from `pez_1_embeddings`, the last K
+  from CLIP padding-token embeddings. L_anchor only acts on the
+  first N rows.
+- `EditConfig.mode` accepts `"add"`; `run_p2p_edit` passes ADD's
+  K value through and treats the last K positions as guaranteed
+  unmapped (LocalBlend mask is built from their cross-attention).
+
+**Estimated time:** 1-2 weeks on top of R4.
+
+#### Phase R6 — EXPLICIT_REPLACE mode (cosine-localized constrained PEZ-2)
+
+**Goal.** When the user supplies `(source_word, target_word)`, localize
+the source word to a specific PEZ-1 position via cosine and run
+constrained PEZ-2 with all other positions frozen.
+
+**Files to modify:**
+- `pez_invert_with_instruction` accepts an optional `source_word: str`
+  and `target_word: str` pair. Runs CLIP on the source word, computes
+  per-position cosine to PEZ-1, picks top-1 (or top-k via threshold).
+- `pez_search` extends to support per-position freezing: a
+  `frozen_positions: set[int]` argument that masks gradient on those
+  rows during optimization.
+- `EditConfig.mode` accepts `"explicit_replace"`; `run_p2p_edit`
+  passes the source/target pair through.
+
+**Estimated time:** 1 week on top of R4.
+
+These phases are non-load-bearing for the project's main
+contribution (the two-PEZ + P2P architecture), but they materially
+expand the supported edit envelope and are natural extensions once
+v1 is validated.
+
 ## 8. Open research questions
 
 These should be addressed during the project; they are not blockers but
@@ -1666,16 +1814,24 @@ statements. The pooled CLIP encoding therefore compresses natural-
 language instructions toward "what would an image of this look
 like." Modal/intentional words get washed out by content nouns.
 
-**Categories of instruction the system handles well:**
-- **Substitution** — `"change X to Y"`, `"replace X with Y"`. CLIP
-  encoding has Y as dominant content; PEZ-2 finds a token shifting
-  X → Y at the appropriate prompt position.
-- **Addition** — `"add a Y"`, `"with a Y"`, `"wearing a Y"`. Same
-  mechanism; Y dominates.
-- **Attribute change** — `"make it brown"`, `"turn its X red"`. The
-  attribute dominates the encoding.
-- **Style change** — `"make it black and white"`, `"in oil painting
-  style"`. The style descriptor dominates.
+**Categories of instruction the system handles well**, mapped to the
+three rule-based modes from §3.0:
+
+- **Substitution** (REPLACE mode in v1; EXPLICIT_REPLACE for
+  multi-subject or far-from-head-noun cases) — user supplies a target
+  descriptor like `"cat"`, or in EXPLICIT_REPLACE a pair like
+  `"dog → cat"`.
+- **Attribute change** (REPLACE mode) — user supplies an attribute
+  descriptor: `"brown fur"`, `"smiling"`, `"old"`. Mechanically
+  identical to substitution: drift one or more positions toward the
+  target attribute.
+- **Addition** (ADD mode, future) — user supplies a noun: `"bowtie"`,
+  `"sunglasses"`. Variable-length PEZ-2 puts the new content in
+  unanchored free slots.
+- **Style change** — currently no dedicated mode; users can attempt
+  it via REPLACE with a style descriptor (`"black and white"`), but
+  LocalBlend may over-mask since style is global. A possible future
+  fourth mode would disable LocalBlend for this case.
 
 **Categories that fail or degrade gracefully:**
 - **Behavioral / preference / mental-state instructions** — e.g.,
@@ -1717,22 +1873,40 @@ The fix requires either:
 None of these is in the project's scope for v1 or v2. The graceful-
 degradation behavior is the cost of avoiding an LLM dependency.
 
-### How users should phrase instructions
+### How users should phrase inputs
 
-For best results, phrase instructions as **descriptions of the
-desired image content**, not as imperatives or modal statements:
+The mode-based design (§3.0) constrains user inputs to specific
+shapes per mode, which sidesteps most phrasing issues:
 
-| Instead of | Phrase as |
+- **REPLACE mode** takes a target descriptor — a content/attribute
+  noun phrase, not an imperative. `"cat"` ✓, `"a sleeping cat"` ✓,
+  `"change the dog to a cat"` ✗ (the verb confuses CLIP).
+- **ADD mode** (future) takes an object noun — `"bowtie"` ✓,
+  `"add a bowtie"` ✗.
+- **EXPLICIT_REPLACE** (future) takes a pair — `("dog", "cat")`,
+  not a sentence.
+
+This is what makes "rule-based modes" a meaningful design choice
+over the prior "auto-detect from instruction text" approach: the
+mode flag tells the system *how* to interpret the input, and the
+input shape per mode is constrained enough that CLIP encoding
+behaves predictably.
+
+For requests outside the supported modes (modal, comparative,
+counterfactual, behavioral) — see the failure-categories list above
+— users should rephrase as a description of desired content:
+
+| Instead of | Phrase as (and pick mode) |
 |---|---|
-| `"make the animal like eating fish more"` | `"add a fish in front of the animal"` (or accept the graceful degradation: `"animal eating fish"`) |
-| `"make it not red"` | `"make it blue"` or whatever specific color is desired |
-| `"make it bigger"` | `"a giant version of X"` if size relative to a referent is the intent |
-| `"remove the dog"` | `"a photo of an empty backyard"` (i.e., describe the desired post-edit content directly) |
+| `"make the animal like eating fish more"` | ADD mode: `"a fish in front of the animal"` |
+| `"make it not red"` | REPLACE mode: `"blue"` (or whatever specific color) |
+| `"make it bigger"` | REPLACE mode: `"a giant version of X"` if size relative to a referent is the intent |
+| `"remove the dog"` | REPLACE mode with a content target: `"an empty backyard"` (describe the post-edit content directly) |
 
-Users who phrase image-content instructions get strong PEZ-2
-behavior. Users who phrase modal/intentional instructions get
-graceful degradation to the closest image-content interpretation.
-This is the expected operating envelope.
+Inputs that fit one of the supported modes get strong behavior.
+Inputs forced into a mode they don't fit get graceful degradation
+to the closest mode-conforming interpretation. This is the expected
+operating envelope.
 
 ### Edit-type envelope: P2P-style edits only
 
