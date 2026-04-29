@@ -445,10 +445,11 @@ Implementation guard rails for v1:
 - `EditConfig` carries a `mode: str` field. Only `"replace"` is
   accepted; `"add"`, `"explicit_replace"`, and `"style"` raise
   `NotImplementedError` with a pointer to RESEARCH_PROPOSAL.md §3.0.
-- `prompt_length` in `pez_1.yaml` is maxed (default 15). REPLACE
-  mode never reserves free slots — every position is source-detail
-  capacity. ADD mode (future) will allocate `prompt_length_extra`
-  on top.
+- `prompt_length` in `pez_1.yaml` is set at the CLIP-77 hard cap
+  (default 75 — CLIP's context is 77, reserving 2 for BOS+EOS).
+  REPLACE mode never reserves free slots — every position is source-
+  detail capacity. ADD mode (future) will allocate
+  `prompt_length_extra` on top of this; PEZ-1's N stays the same.
 - `pez_invert_with_instruction` operates as REPLACE-mode by default:
   all N positions of `pez_1_embeddings` are unfrozen and used as the
   warm-start; the 3-term joint loss optimizes them jointly.

@@ -28,10 +28,16 @@ timestep_sampling: uniform    # "uniform" or "importance" — focus on
                               # strongest. Implement uniform first.
 
 # ─── Prompt structure ────────────────────────────────────────────
-prompt_length: 15             # N positions in [N, 768]. Larger N →
-                              # more detail capacity (see proposal
-                              # §3.2 detail-richness). Recommended
-                              # 12-20.
+prompt_length: 75             # N positions in [N, 768]. The HARD MAX
+                              # is 75 (CLIP context is 77; reserve 2
+                              # for BOS+EOS). Going to the cap gives
+                              # maximum capacity for multi-subject
+                              # scenes where each subject needs ~10-15
+                              # positions for clean per-subject
+                              # specialization (proposal §3.2 detail-
+                              # richness; cf. husky+chihuahua test).
+                              # Lower values (15-30) are fine for
+                              # single-subject scenes.
                               #
                               # REPLACE-mode (v1) maxes this — every
                               # position is source-detail capacity,
@@ -41,8 +47,13 @@ prompt_length: 15             # N positions in [N, 768]. Larger N →
                               # slots; PEZ-1's N stays the same.
 
 # ─── Optimization ────────────────────────────────────────────────
-num_steps: 1500               # PEZ optimization steps. More for
-                              # larger N or sds (vs clip).
+num_steps: 3000               # PEZ optimization steps cap. More for
+                              # larger N or sds (vs clip). Bumped
+                              # from 1500 to 3000 for N=75 to give
+                              # the larger soft prompt room to
+                              # converge; adaptive early stopping in
+                              # pez_search shortcircuits when the
+                              # variable stops moving.
 learning_rate: 0.1            # AdamW lr on the soft prompt
 
 # ─── Round-0 (vanilla PEZ) regularization ────────────────────────

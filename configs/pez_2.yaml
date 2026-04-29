@@ -35,7 +35,11 @@ gamma_anchor: 0.1             # too low → per-position drift breaks
 # sooner when the soft prompt converges. RESEARCH_PROPOSAL.md §3.2
 # allows 300-800; we set the cap conservatively to bound worst-case
 # cost in the (λ, γ) sweep.
-num_steps: 300
+num_steps: 600                # cap; bumped from 300 to 600 to give
+                              # N=75 soft prompts room to converge.
+                              # Adaptive early stopping in pez_search
+                              # shortcircuits when convergence is
+                              # detected.
 learning_rate: 0.05           # lower than PEZ-1 since we're refining
 # (No projection_every: continuous PEZ doesn't snap to vocabulary.)
 
