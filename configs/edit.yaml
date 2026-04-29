@@ -34,11 +34,19 @@ cross_attention:
   cross_replace_steps: 0.8
   layer_indices: null         # null = all cross-attention layers
 
-# Token alignment between PEZ-1 and PEZ-2 prompts.
-# "lcs" = LCS over token IDs (default, fast)
-# "semantic" = CLIP-embedding-based (deferred to v2; raises
-# NotImplementedError if requested)
-alignment_method: lcs
+# Per-position alignment between PEZ-1 and PEZ-2 continuous embeddings.
+# Warm-start gives source/target identical length and per-position
+# correspondence by construction; alignment reduces to a per-position
+# cosine-similarity threshold.
+#
+# "cosine_threshold" = matched if cos_sim(src[i], tgt[i]) >= alignment_threshold;
+#                      unmapped otherwise. Default and only supported method.
+# (Legacy "lcs" / "semantic" methods removed — see RESEARCH_PROPOSAL.md
+#  Appendix B for alternatives if cosine threshold proves insufficient.)
+alignment_method: cosine_threshold
+alignment_threshold: 0.95     # τ in RESEARCH_PROPOSAL.md §3.3.
+                              # Sweep (0.90, 0.99) if alignment proves
+                              # noisy on real PEZ-2 outputs.
 
 device: cuda
 dtype: float16

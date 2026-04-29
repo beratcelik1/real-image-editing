@@ -1,11 +1,13 @@
-# PEZ-2: instruction-conditioned target prompt generation
+# PEZ-2: instruction-conditioned target embedding generation
 #
 # Used by: src/pez/instruction_conditioned.py
+# Output: Tensor[prompt_length, 768] continuous CLIP-input embeddings
+#         (same shape as PEZ-1's output; no vocabulary projection).
 # Three-term loss:
 #   L = L_source + lambda_instruction * L_instr + gamma_anchor * L_anchor
 # where L_source is the same loss family as PEZ-1 (controllable via
 # source_loss_type), L_instr is text-text CLIP cosine, and L_anchor
-# is L2 to the warm-start initialization.
+# is L2 to the warm-start initialization in soft-prompt space.
 
 # ─── Source-preservation term (mirrors PEZ-1's loss) ─────────────
 # Should match PEZ-1's loss_type for consistency. Both being "sds"
@@ -21,16 +23,17 @@ lambda_instruction: 1.0       # too low → no edit; too high → drift
                               # off source
 
 # ─── Warm-start anchor term ──────────────────────────────────────
-warm_start: true              # initialize from PEZ-1's vocab embeddings
-gamma_anchor: 0.1             # too low → P2P alignment breaks
-                              # too high → no edit happens
+warm_start: true              # initialize soft_prompt = pez_1_embeddings.clone()
+                              # (continuous identity copy, no vocab lookup)
+gamma_anchor: 0.1             # too low → per-position drift breaks
+                              # alignment; too high → no edit happens
 
 # ─── Optimization ────────────────────────────────────────────────
 # PEZ-2 is faster than PEZ-1 because warm-starting refines a near-
 # correct solution.
 num_steps: 500
 learning_rate: 0.05           # lower than PEZ-1 since we're refining
-projection_every: 1
+# (No projection_every: continuous PEZ doesn't snap to vocabulary.)
 
 # ─── Models ──────────────────────────────────────────────────────
 # See configs/pez_1.yaml for the dim-matching rule. PEZ-2 uses CLIP
@@ -40,8 +43,9 @@ projection_every: 1
 clip_model: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
 
 # ─── Caching ─────────────────────────────────────────────────────
-# Hash key includes config + image + instruction + pez_1 token IDs +
-# null_text hash (when sds).
+# Hash key includes config + image + instruction + pez_1 embeddings
+# hash (sha256 of tensor bytes) + null_text hash (when sds).
+# Cached target embeddings are continuous tensors (.pt files).
 cache_dir: cache/pez_target_prompts/
 use_cache: true
 

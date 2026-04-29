@@ -1,9 +1,13 @@
-# PEZ-1: source-image inversion to discrete CLIP-vocabulary prompt
+# PEZ-1: source-image inversion to continuous CLIP-input embeddings
 #
 # Used by: src/pez/source_inversion.py
-# Algorithm: Wen et al. 2023 "Hard Prompts Made Easy" (PEZ),
-#            adapted from external/pez/optim_utils.py
+# Algorithm: Wen et al. 2023 "Hard Prompts Made Easy" (PEZ) optimization
+#            machinery, adapted from external/pez/optim_utils.py with
+#            the straight-through vocabulary projection step REMOVED.
+#            The soft prompt is the canonical output (no discrete
+#            tokenization). See RESEARCH_PROPOSAL.md §3.1.
 # Loss: pluggable — see loss_type below.
+# Output: Tensor[prompt_length, 768] continuous embeddings.
 
 # ─── Loss formulation ────────────────────────────────────────────
 # "sds": CFG-aware score-distillation surrogate of "prompt + null-text
@@ -24,9 +28,10 @@ timestep_sampling: uniform    # "uniform" or "importance" — focus on
                               # strongest. Implement uniform first.
 
 # ─── Prompt structure ────────────────────────────────────────────
-prompt_length: 15             # N tokens. Larger N → more detail
-                              # captured (see proposal §3.2 detail-
-                              # richness). Recommended 12-20.
+prompt_length: 15             # N positions in [N, 768]. Larger N →
+                              # more detail capacity (see proposal
+                              # §3.2 detail-richness). Recommended
+                              # 12-20.
 
 # ─── Optimization ────────────────────────────────────────────────
 num_steps: 1500               # PEZ optimization steps. More for
@@ -34,8 +39,7 @@ num_steps: 1500               # PEZ optimization steps. More for
 learning_rate: 0.1            # AdamW lr on the soft prompt
 weight_decay: 0.1
 batch_size: 1
-projection_every: 1           # project soft prompt to vocab every
-                              # k steps. 1 is standard PEZ.
+# (No projection_every: continuous PEZ doesn't snap to vocabulary.)
 
 # ─── Models ──────────────────────────────────────────────────────
 # Must match SD's text-encoder dim or clip_similarity_loss errors on
@@ -53,7 +57,8 @@ num_rounds: 2
 
 # ─── Caching ─────────────────────────────────────────────────────
 # Hash key includes config + image bytes + round index. Intermediate
-# (c_r, N_r) tuples are cached so resume-on-crash is cheap.
+# (embeddings_r, N_r) tuples are cached so resume-on-crash is cheap.
+# Cached embeddings are continuous tensors (.pt files), not strings.
 cache_dir: cache/pez_source_prompts/
 use_cache: true
 

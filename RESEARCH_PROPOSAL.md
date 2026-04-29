@@ -1,41 +1,48 @@
-# Hard Edits Made Easy: Instruction-Conditioned Discrete Prompt Inversion for Real-Image Editing
+# Hard Edits Made Easy: Instruction-Conditioned Prompt-Embedding Inversion for Real-Image Editing
 
-> A direct extension of Wen et al. 2023's "Hard Prompts Made Easy"
-> (PEZ): we apply discrete prompt inversion to **both** the source-
-> representation problem and the instruction-following problem,
-> producing a fully-automated real-image editing pipeline from two
-> PEZ optimizations:
+> Two PEZ-style continuous-prompt optimizations (Wen et al. 2023's
+> "Hard Prompts Made Easy" run without the vocabulary-projection step,
+> giving us continuous prompt embeddings rather than discrete tokens),
+> applied to **both** the source-representation problem and the
+> instruction-following problem, producing a fully-automated real-image
+> editing pipeline:
 >
-> 1. **PEZ-1** runs on the source image → produces a discrete CLIP-
->    vocabulary prompt that reconstructs the source. Replaces BLIP-2
->    captioning as the source representation.
+> 1. **PEZ-1** runs on the source image → produces N continuous
+>    CLIP-input embeddings `[N, 768]` that reconstruct the source.
+>    Replaces BLIP-2 captioning as the source representation.
 >
 > 2. **PEZ-2** runs on `(source image, user instruction)` jointly →
->    produces a discrete prompt satisfying both the source's visual
->    content and the instruction's semantic intent. Warm-started from
->    PEZ-1's solution so the two prompts share token positions for
->    unchanged content. Instruction following emerges from CLIP's
->    existing semantic alignments via embedding-space optimization —
->    no LLM, no rule-based parser, no learned task-specific model.
+>    produces N continuous embeddings satisfying both the source's
+>    visual content and the instruction's semantic intent. Warm-started
+>    from PEZ-1's embeddings so the two prompts share embedding values
+>    at positions unaffected by the instruction. Instruction following
+>    emerges from CLIP's existing semantic alignments via embedding-
+>    space optimization — no LLM, no rule-based parser, no learned
+>    task-specific model.
 >
 > A non-obvious advantage of this formulation: with large N (long
 > prompts), PEZ recovers visual details the user wouldn't think to
-> specify. For `"change the husky into a cat"`, PEZ-2 finds a cat
-> breed whose visual signature matches the source husky's coloring
+> specify. For `"change the husky into a cat"`, PEZ-2 finds an
+> embedding whose visual signature matches the source husky's coloring
 > and fur texture — automatically — by satisfying the source-image-
 > similarity term while moving toward the instruction. **The system
 > doesn't just automate what a user would do; it does it better than
 > the user could.**
 >
 > Existing P2P attention-editing machinery composes with PEZ-1 /
-> PEZ-2 outputs unchanged: they share most token positions (warm-start
-> property), so P2P alignment is trivial; positions affected by the
-> instruction differ between source and target, becoming the unmapped
-> positions that drive local-blend masking.
+> PEZ-2 outputs unchanged: warm-start gives source/target prompts the
+> same length and per-position correspondence by construction, so
+> alignment reduces to a per-position cosine-distance check. Positions
+> where the target embedding drifted from source by more than a
+> threshold are the "unmapped" positions; they drive local-blend
+> masking.
 >
-> Optional **bounded continuous refinement** (`||Δ|| ≤ ε`) on PEZ-1
-> and/or PEZ-2 outputs gives a tunable fidelity lever without losing
-> position-stability.
+> Note on terminology: we keep the name **"PEZ"** because the
+> optimization machinery (soft prompt + AdamW + CLIP/SD gradient flow)
+> is Wen et al.'s. The change vs. their original is dropping the
+> straight-through projection to vocabulary points — the soft prompt
+> *is* the output, no longer an intermediate representation. Where the
+> distinction matters we say **"continuous PEZ"** explicitly.
 
 ---
 
@@ -74,18 +81,19 @@ Two communities work on adjacent problems with non-interoperable primitives:
 
 The two methods are not currently composable. **Textual inversion produces
 embeddings that destroy P2P alignment**: a learned `e_S*` doesn't have an
-identifiable lexical role in the prompt — it's "this image's gestalt"
+identifiable per-position role in the prompt — it's "this image's gestalt"
 collapsed into one 768-dim point. P2P's mechanism (copying attention
 columns at matched token positions) needs the source and target prompts
-to share interpretable structure: `"dog"` in source aligns to `"dog"` in
-target; their cross-attention columns can be swapped because both are
-the column for the noun "dog" at a specific position.
+to share *position correspondence*: position 5 in source carries the
+same role as position 5 in target so their cross-attention columns can
+be swapped meaningfully.
 
 If your source prompt is `"a photograph of a S*"` and your target is
-`"a photograph of a S* with a T*"`, the only positions occupying real
-content are S* and T* — and their cross-attention behavior is whatever
-happened to emerge during textual inversion training. Nothing about
-the training procedure encourages those columns to be:
+`"a photograph of a S* with a T*"`, the only positions occupying
+content learned for this image are S* and T* — and their cross-attention
+behavior is whatever happened to emerge during textual inversion
+training. Nothing about the training procedure encourages those columns
+to be:
 
 - **Localized** — concentrated at one position rather than smeared across
   the contextual encoding
@@ -95,54 +103,72 @@ the training procedure encourages those columns to be:
   cross-attention columns behave (so P2P's column-swap operation
   produces sensible results)
 
-This is the gap. Standard textual inversion optimizes only for
-*reconstruction fidelity*. It doesn't optimize for any of the properties
-that make a learned concept play well with downstream attention editing.
+This is the gap. Standard textual inversion optimizes a single
+embedding for *reconstruction fidelity only*. It captures one image's
+gestalt at one position; it doesn't give us a position-structured
+multi-token representation, an instruction-conditioning mechanism, or
+an alignment story for downstream attention editing.
 
-### Our approach: two PEZ optimizations, source and instruction-conditioned
+### Our approach: two continuous-PEZ optimizations, source and instruction-conditioned
 
-The personalization literature pursues fidelity by moving from
-discrete CLIP vocabulary into continuous embedding space. That move is
-what causes the smearing in the first place. **We propose the opposite
-direction: stay in discrete-token space throughout, and let
-instruction-following emerge from CLIP's existing semantic alignments
-via embedding-space optimization.**
+The personalization literature uses N=1 continuous embeddings
+optimized for reconstruction. That single-vector design is part of
+why TI doesn't compose with P2P — there's no per-position structure
+for alignment to anchor on. **We propose: optimize N continuous
+embeddings (N≈15) with three structural ingredients TI lacks: a
+reconstruction-aware loss tied to the editing pipeline (CFG-aware
+SDS with null-text), an instruction-conditioning pass with a warm-
+start anchor, and per-position alignment for P2P composition.**
 
-The pipeline runs **PEZ** (Wen et al. 2023, "Hard Prompts Made Easy")
-twice with different conditioning:
+The pipeline runs **continuous PEZ** twice with different conditioning:
 
 1. **PEZ-1: source-image inversion.** Replace BLIP-2 captioning with
-   PEZ-on-source. PEZ optimizes a sequence of *real CLIP vocabulary
-   tokens* (actual English words) that, when used as a prompt, make
-   the model reconstruct the source image. Because the output is real
-   CLIP tokens, position-stability is automatic: P2P treats them like
-   any other natural-vocabulary tokens.
+   continuous-PEZ-on-source. The optimization produces a sequence of
+   N continuous 768-dim embeddings that, when used as the input to
+   CLIP's text encoder, make the model reconstruct the source image
+   under our DDIM-inversion + null-text + denoising stack.
+   Per-position structure is explicit: each of the N positions has a
+   stable role, and the warm-start property (below) carries that role
+   into PEZ-2.
 
 2. **PEZ-2: instruction-conditioned target generation.** PEZ runs a
    second time with two simultaneous CLIP similarity targets:
    - the source image (preserve visual content)
    - the user's natural-language instruction text (apply edit)
-   
-   Warm-started from PEZ-1's discovered tokens, the optimization
-   produces a target prompt that mostly matches PEZ-1 but with
-   instruction-relevant positions modified. This is the key technical
-   piece — instruction following emerges from CLIP's pretrained
-   semantic alignments through PEZ-2's joint loss, with **no LLM,
-   no rule-based parser, no learned task-specific model.**
+
+   Warm-started from PEZ-1's embeddings, the optimization produces a
+   target prompt that mostly matches PEZ-1 except at positions under
+   strong instruction-pressure. This is the key technical piece —
+   instruction following emerges from CLIP's pretrained semantic
+   alignments through PEZ-2's joint loss, with **no LLM, no rule-
+   based parser, no learned task-specific model.**
 
 The two prompts (PEZ-1 → source, PEZ-2 → target) compose with existing
 P2P unchanged because:
 
-- Most positions match (warm-start) → P2P alignment is trivial via
-  token-ID matching
-- Positions that differ are the edits → unmapped, drive local-blend
-  masking
-- All tokens are real CLIP vocabulary → cross-attention behaves as
-  CLIP was trained for
+- **Same length, same per-position initialization** (warm-start) →
+  position `i` in source corresponds to position `i` in target by
+  construction. No alignment search needed.
+- **Per-position cosine distance** identifies which positions drifted
+  during PEZ-2's optimization. Positions where target stayed close to
+  source are "matched" (P2P injects); positions where target drifted
+  beyond a threshold are "unmapped" (P2P leaves alone, and the local
+  blend mask is built from those positions' cross-attention).
+- **Reconstruction-aware optimization** ensures each position's
+  cross-attention behavior is calibrated to actual image
+  reconstruction, not just CLIP cosine — this is what makes
+  per-position cross-attention well-localized for P2P/LocalBlend.
 
-**Optional continuous refinement** (`||Δ|| ≤ ε`) can be applied to
-either PEZ output to recover fidelity beyond what discrete vocabulary
-allows, with bounded perturbations that preserve position-stability.
+The discrete-token-projection step from Wen et al.'s original PEZ is
+**dropped throughout**: the soft prompt *is* the prompt. We retain the
+"PEZ" name because the optimization machinery (AdamW on a soft prompt
+with gradient flow through CLIP and SD's U-Net) is theirs; we just
+keep the result continuous instead of snapping to vocabulary points.
+This keeps strictly more reconstruction fidelity (no Voronoi
+quantization loss) and avoids a Voronoi-jump nonlinearity in the
+optimization landscape. For human-readable logging or debugging, an
+optional snap-to-nearest-vocabulary step can be applied at inference
+time *only* — never during optimization.
 
 ### Additive editing is the hardest case (and the primary showcase)
 
@@ -162,12 +188,12 @@ replacement doesn't:
 
 1. **Local-blend mask collapse.** Additive edits depend on the local
    blend mechanism (specified in Appendix A) to give the new concept
-   spatial room. The mask is built from
-   cross-attention to the new concept's column. If that column is
-   smeared (the bowtie's "signal" leaks across the encoding), the
-   cross-attention pattern is spatially diffuse. The mask either
-   over-covers (loses structure) or under-covers (no room for the
-   concept). Either way, the additive edit fails.
+   spatial room. The mask is built from cross-attention to the new
+   concept's column. If that column is smeared (the bowtie's "signal"
+   leaks across the encoding), the cross-attention pattern is
+   spatially diffuse. The mask either over-covers (loses structure)
+   or under-covers (no room for the concept). Either way, the
+   additive edit fails.
 
 2. **P2P injection actively erases the concept.** This is the worse
    failure. When `e_bowtie` smears to positions 5, 6, 7 (the
@@ -184,12 +210,27 @@ Replacement edits don't have failure mode 2 because the source and
 target both have learned content at the smearing positions; the
 "erasure" cancels because both sides have similar smearing.
 
+**Why our N continuous-embedding design avoids both modes.**
+
+- *Failure mode 1* is mitigated by the SDS-CFG reconstruction-aware
+  loss (Section 3.1). Each position's contribution to cross-attention
+  is shaped by gradient flow through SD's U-Net during training, so
+  positions naturally end up with localized cross-attention columns
+  rather than smeared ones — that's the loss landscape rewarding
+  position-localized contributions over diffuse ones.
+- *Failure mode 2* is mitigated by the per-position warm-start
+  anchor and per-position alignment. Source position `i` and target
+  position `i` are the same row by construction; positions that
+  drifted under PEZ-2's optimization are explicitly identified by
+  cosine distance and marked *unmapped*. P2P does not inject onto
+  unmapped positions, so new content at those positions stays put.
+
 **This makes additive editing the empirical showcase for the
-proposed architecture.** If discrete-prompt + corpus-expert composition
-materially improves additive edit quality vs. continuous-TI injection,
-the contribution is real and measurable. If it only helps replacement
-edits, the contribution is marginal because replacement was already
-mostly working.
+proposed architecture.** If our continuous-PEZ + warm-start + per-
+position alignment design materially improves additive edit quality
+vs. vanilla TI injection, the contribution is real and measurable.
+If it only helps replacement edits, the contribution is marginal
+because replacement was already mostly working.
 
 ## 2. Hypothesis
 
@@ -206,18 +247,17 @@ testable and could fail without the others failing.
 
 ### Sub-claim 1 — PEZ-1 as source representation beats captioning
 
-PEZ run on the source image yields a discrete prompt that, when used
-for DDIM inversion, reconstructs the source image at higher fidelity
-than a BLIP-2 caption of the same image.
+Continuous PEZ run on the source image yields N continuous prompt
+embeddings that, when used for DDIM inversion, reconstruct the source
+image at higher fidelity than a BLIP-2 caption of the same image.
 
 - **Measurement.** PSNR / SSIM / LPIPS on source images reconstructed
   via DDIM inversion + null-text optimization. Compare:
   - BLIP-2 caption + inversion (baseline)
   - Hand-crafted caption + inversion (human ceiling)
   - PEZ-1 + inversion (proposed)
-  - PEZ-1 + bounded continuous refinement (`||Δ|| ≤ ε`)
 - **Failure mode.** PEZ doesn't beat captioning. This would mean
-  PEZ's CLIP-image-similarity objective doesn't align with what
+  PEZ's reconstruction-aware objective doesn't align with what
   makes a prompt good for DDIM inversion.
 - **Risk level.** Low–medium. PEZ is published and known to optimize
   CLIP-image alignment. Whether that translates to inversion fidelity
@@ -225,34 +265,37 @@ than a BLIP-2 caption of the same image.
 
 ### Sub-claim 2 — PEZ-2 (instruction-conditioned) produces correct target prompts
 
-Running PEZ with a joint loss `L = -cos_sim(prompt, image) - λ ·
-cos_sim(prompt, instruction)`, warm-started from PEZ-1's solution,
-produces target prompts that:
+Running PEZ with a three-term joint loss (source-preservation +
+instruction-following + warm-start anchor), warm-started from PEZ-1's
+solution, produces target embeddings that:
 
-- Preserve PEZ-1's tokens at positions unaffected by the instruction
+- Preserve PEZ-1's embeddings at positions unaffected by the instruction
 - Modify positions affected by the instruction to satisfy its semantic
   intent
-- Remain mostly-aligned with PEZ-1 at the token-ID level
+- Remain mostly-aligned with PEZ-1 at the per-position embedding level
+  (i.e., low cosine distance at most positions)
 
 For a substitution edit `"change the animal into a cat"` against a
-source dog photo, PEZ-2 should produce something like
-`[a, photo, of, a, fluffy, brown, cat, sitting, grass]` with `dog`
-swapped for `cat`. For an additive edit `"add a bowtie"`, PEZ-2
-should produce `[..., wearing, a, bowtie]` with the source tokens
-preserved and bowtie tokens appended (or inserted at a sensible
-position).
+source dog photo, PEZ-2 should produce embeddings where one position
+(the head-noun position encoding "dog") drifts toward cat-cluster in
+CLIP embedding space and the other positions stay near PEZ-1.
+For an additive edit `"add a bowtie"`, PEZ-2 should produce
+embeddings where one or two positions encode bowtie content while the
+rest stay anchored.
 
 - **Measurement.** On a fixed test set of (image, instruction, expected
   edit type) triples, measure:
-  - **Token preservation rate**: fraction of PEZ-1's tokens that
-    appear at the same position in PEZ-2's output. High preservation
-    (>70%) means warm-start is doing its job.
+  - **Per-position embedding stability**: fraction of positions where
+    the cosine distance between PEZ-1 and PEZ-2 embeddings stays
+    below threshold τ (default 0.05). High stability (>70%) means
+    warm-start is doing its job.
   - **Edit semantic correctness** (human raters): does PEZ-2's prompt
-    describe an image satisfying the instruction?
-  - **CLIP similarity** of PEZ-2's output to a hand-crafted "ground-
-    truth" target prompt for each test case.
+    describe an image satisfying the instruction? (Project to nearest
+    vocabulary at inspection time for human readability.)
+  - **CLIP similarity** of PEZ-2's pooled output to a hand-crafted
+    "ground-truth" target prompt for each test case.
 - **Failure mode.** PEZ-2 either drifts too far from PEZ-1 (low
-  preservation, P2P alignment breaks) or doesn't drift enough (low
+  stability, P2P alignment breaks) or doesn't drift enough (low
   edit correctness, instruction not applied). This is the λ vs. γ
   tuning question.
 - **Risk level.** Medium. The mechanism is sound but the operating
@@ -262,42 +305,33 @@ position).
 
 Existing P2P and local-blend machinery — designed for natural-
 language prompts — composes with PEZ-1 / PEZ-2 outputs without
-modification. **This is the architectural claim.**
+modification at the K/V level. The only adapter needed is replacing
+LCS-over-token-IDs with per-position cosine-distance alignment, since
+our outputs are continuous embeddings rather than discrete IDs.
+**This is the architectural claim.**
 
-- **Why we believe it.** PEZ outputs are real CLIP vocabulary tokens.
-  Source and target prompts share most positions (warm-start). P2P
-  alignment via token-ID matching trivially maps shared positions;
-  unchanged positions get attention swap; modified positions are
-  unmapped and drive local-blend masking.
+- **Why we believe it.** P2P's K/V swap operates on continuous CLIP
+  hidden states regardless of how the prompt was produced. Warm-start
+  ensures source and target prompts have the same length and per-
+  position correspondence by construction. Per-position cosine
+  distance trivially identifies which positions drifted (unmapped,
+  driving local-blend masking) vs. which stayed close (matched,
+  receiving P2P injection).
 - **Measurement.** End-to-end editing quality on substitution and
   additive edit splits (Section 4.4). Compare PEZ-1/PEZ-2 + P2P
   against:
-  - Continuous TI + P2P (broken baseline)
+  - Vanilla TI + P2P (broken baseline — TI's N=1, no per-position
+    structure, no warm-start anchor)
   - BLIP-2 caption + hand-crafted target + P2P (natural-language
     ceiling, with human in the loop)
   - InstructPix2Pix (instruction-trained baseline)
 - **Failure mode.** PEZ outputs work for inversion but P2P edits
   on top produce poor structural preservation. Would suggest PEZ-2's
-  outputs have structural properties that fight against P2P's
-  alignment expectations.
+  per-position drift pattern doesn't isolate cleanly under cosine-
+  threshold alignment, or that the cross-attention columns aren't
+  spatially localized enough for LocalBlend to mask cleanly.
 - **Risk level.** Medium. Compositional argument is sound; empirical
   confirmation needed.
-
-### Sub-claim 4 — Bounded continuous refinement gives a useful Pareto frontier
-
-Adding small perturbations `Δ_i ∈ ℝ^768` with `||Δ_i|| ≤ ε` to PEZ-1
-(and optionally PEZ-2) outputs improves reconstruction fidelity
-without breaking position-stability or P2P composability.
-
-- **Measurement.** Sweep ε for both PEZ-1 and PEZ-2 outputs:
-  - Reconstruction fidelity (PSNR / SSIM / LPIPS)
-  - Footprint concentration in the contextual encoding
-  - End-to-end editing quality
-- **Failure mode.** No useful frontier — either fidelity barely
-  improves before stability collapses or vice versa.
-- **Risk level.** Low. This is a smaller, optional fidelity boost
-  on top of the core (PEZ-1 + PEZ-2) architecture. If sub-claim 4
-  fails, drop refinement; the main pipeline still works.
 
 ### Risk map
 
@@ -305,12 +339,10 @@ without breaking position-stability or P2P composability.
 |---|---|---|
 | 1 — PEZ-1 > captioning | Low–medium | Fall back to BLIP-2 for source; PEZ-2 still works on top of caption-derived source |
 | 2 — PEZ-2 produces correct targets | Medium | Tune (λ, γ) more carefully, or fall back to user-provided target descriptions |
-| 3 — P2P compose with PEZ outputs | Medium | Investigate why; may require token-order regularization in PEZ-1/PEZ-2 |
-| 4 — Useful Pareto for refinement ε | Low | Operate at ε=0 (pure discrete); main architecture still works |
+| 3 — P2P compose with PEZ outputs | Medium | Investigate per-position drift patterns; may require an explicit position mask or per-position L_anchor weighting |
 
 The project's contribution lives or dies on **sub-claims 2 and 3**.
-Sub-claim 1 is supporting (better source representation); sub-claim 4
-is a fidelity boost that's nice to have but not essential.
+Sub-claim 1 is supporting (better source representation).
 
 - Sub-claim 1 fails → caption-source + PEZ-2 still gives instruction-
   conditioned editing. Smaller contribution but still novel.
@@ -318,27 +350,25 @@ is a fidelity boost that's nice to have but not essential.
   manually describe target prompts. Project pivots to "PEZ as
   source representation for attention editing" — Option 1 from our
   earlier discussion.
-- Sub-claim 3 fails → core architecture broken; investigate token-
-  order regularization or per-position constraints in PEZ.
-- Sub-claim 4 fails → drop refinement; ε=0 throughout. No fidelity
-  boost but everything else works.
+- Sub-claim 3 fails → core architecture broken; investigate per-
+  position constraints in PEZ-2 or fallback alignment mechanisms.
 
 ### What success enables
 
-If all four sub-claims hold, the editing pipeline becomes:
+If all three sub-claims hold, the editing pipeline becomes:
 
 ```
 Per edit:
-  1. PEZ-1 on source image (cached) → source prompt
+  1. PEZ-1 on source image (cached) → source embeddings [N, 768]
   2. PEZ-2 on (source image, user instruction), warm-started from
-     PEZ-1 → target prompt
-  3. (Optional) Bounded refinement on PEZ-1/PEZ-2 outputs
-  4. DDIM-invert source under source prompt encoding
-  5. Run P2P edit:
-     - Token-ID matching aligns shared positions
-     - Cross-attention swap copies source attention at mapped positions
-     - Differing positions are unmapped → drive local blend mask
-  6. Decode → edited image
+     PEZ-1 → target embeddings [N, 768]
+  3. DDIM-invert source under source embedding's CLIP encoding
+  4. Run P2P edit:
+     - Per-position cosine distance partitions positions into
+       matched (close to source) and unmapped (drifted)
+     - Cross-attention swap copies source attention at matched positions
+     - Unmapped positions drive local blend mask
+  5. Decode → edited image
 ```
 
 The whole pipeline is built from one PEZ algorithm (run twice with
@@ -350,12 +380,11 @@ demonstration in Section 11.
 ## 3. The core method
 
 The architecture has three core pieces:
-- **3.1**: PEZ-1 — source-image inversion to discrete prompt
+- **3.1**: PEZ-1 — source-image inversion to continuous prompt embeddings
 - **3.2**: PEZ-2 — instruction-conditioned target generation
 - **3.3**: P2P integration
 
-Plus two supporting subsections:
-- **3.4**: Bounded continuous refinement (optional fidelity lever)
+Plus one supporting subsection:
 - **3.5**: Why this fixes additive editing structurally
 
 And one summary subsection:
@@ -366,16 +395,19 @@ Each maps to one or more of the sub-claims in Section 2.
 
 ### 3.1 PEZ on the source image (sub-claim 1)
 
-**What it does.** Replaces BLIP-2 captioning with discrete prompt search
-to produce a source prompt directly optimized for *recovering the image
+**What it does.** Replaces BLIP-2 captioning with continuous-PEZ to
+produce a source prompt directly optimized for *recovering the image
 through our pipeline*, not for from-scratch generation.
 
-**Algorithm.** PEZ (Wen et al. 2023) maintains a soft prompt — N
-continuous embedding vectors — and runs gradient updates with a
-straight-through projection to the nearest CLIP vocabulary tokens.
-We adapt the algorithm but **modify the loss** so that the prompt is
-optimized for our actual reconstruction pipeline rather than for
-matching CLIP-image similarity (which would be vanilla PEZ).
+**Algorithm.** Continuous PEZ maintains a soft prompt — N continuous
+768-dim embedding vectors — and runs AdamW updates on it directly
+(no straight-through projection to vocabulary). The original Wen et
+al. 2023 algorithm projects the soft prompt to nearest CLIP
+vocabulary tokens at each step; we drop that step. The soft prompt
+*is* the output, fed directly to CLIP's text encoder at inference.
+We **modify the loss** so that the prompt is optimized for our
+actual reconstruction pipeline rather than for matching CLIP-image
+similarity (which would be vanilla PEZ).
 
 **The reconstruction-aware loss.** Vanilla PEZ optimizes
 `L = -cos_sim(prompt_emb, image_emb)` — "find a prompt that, paired
@@ -492,6 +524,14 @@ calls (~1500 SD passes each). Total per source image: ~25-50 minutes
 on an A100. Each step is a known-working component, so failure modes
 are isolated and recoverable.
 
+**Inference-time human-readable projection (optional).** For logging
+or debugging, snap each soft-prompt position to its nearest CLIP
+vocabulary embedding and decode the resulting token IDs as a string.
+This is a *one-shot* operation at inference, never during
+optimization. The decoded string is illustrative only — the canonical
+PEZ-1 output is the continuous `[N, 768]` tensor. Don't make pipeline
+decisions based on the projected string.
+
 **Geometry-partition diagnostic.** After PEZ-1 produces `(prompt,
 null_text)`, generate from null-text alone (CFG=1, no prompt) starting
 from `z_T`:
@@ -565,7 +605,8 @@ instr_emb  = clip_text_encoder(instruction_text)     # [768] for L_instr
 null_text  = pre_computed_null_text_embedding        # [1, 77, 768] for L_source
 
 # Optimization variable — the soft prompt:
-soft_prompt = init_from_pez1_tokens()                # [N, 768]  (warm start)
+soft_prompt = pez_1_embeddings.clone()               # [N, 768]  (warm start)
+soft_prompt_init = soft_prompt.detach().clone()      # frozen reference
 
 # At each gradient step:
 # L_source: SDS-CFG (same form as PEZ-1's loss)
@@ -587,7 +628,8 @@ L_anchor = ||soft_prompt - soft_prompt_init||²
 # Combined:
 L = L_source + λ · L_instr + γ · L_anchor
 
-# Backprop through CLIP/U-Net; project to discrete vocab; repeat.
+# Backprop through CLIP/U-Net; AdamW step on soft_prompt; repeat.
+# No vocabulary projection — soft_prompt is the canonical output.
 ```
 
 Three loss terms, three roles:
@@ -599,10 +641,10 @@ Three loss terms, three roles:
    describing the desired post-edit outcome. The instruction is text;
    text-text CLIP similarity is the appropriate signal.
 3. **Warm-start anchor** (`L_anchor`): keeps the soft prompt close
-   to PEZ-1's discrete tokens unless an instruction pressure overrides.
-   This is what gives us the "minimal edit" property — most positions
-   stay at PEZ-1's tokens; only positions under strong instruction
-   pressure shift.
+   to PEZ-1's per-position embeddings unless an instruction pressure
+   overrides. This is what gives us the "minimal edit" property —
+   most positions stay at PEZ-1's embeddings; only positions under
+   strong instruction pressure shift in 768-dim space.
 
 **Why this is not the same as classical instruction-following.**
 CLIP doesn't really understand instructions like
@@ -610,11 +652,11 @@ CLIP doesn't really understand instructions like
 descriptions, and the encoding is dominated by the *target / changed
 content* (`cat`) rather than by action verbs (`change`).
 
-The PEZ-2 optimization exploits this: it finds a discrete prompt that
-matches both the source image and the (target-content-dominated)
-instruction. The result naturally describes the source's composition
-with the changed content swapped in. There's no parsing of the
-instruction's structure required — the semantic content of the
+The PEZ-2 optimization exploits this: it finds a continuous embedding
+sequence that matches both the source image and the (target-content-
+dominated) instruction. The result naturally describes the source's
+composition with the changed content swapped in. There's no parsing
+of the instruction's structure required — the semantic content of the
 instruction does the work via CLIP's similarity space.
 
 **What does instruction encoding actually contain.** Worth being
@@ -637,16 +679,16 @@ the source. For removal-style edits, this approach has limitations.
 
 | Level | What lives there | Role in PEZ-2 |
 |---|---|---|
-| Soft prompt | `[N, 768]` continuous vectors | The optimization variable; gradients land here |
-| Pooled / projected (joint space) | `[768]` | Where similarity losses are computed |
-| Discrete tokens | `[N]` token IDs | Final output via projection |
+| Soft prompt | `[N, 768]` continuous vectors | The optimization variable; gradients land here; **also the canonical output** |
+| Pooled / projected (joint space) | `[768]` | Where the L_instr similarity loss is computed |
 
-The soft prompt is initialized from the embeddings of PEZ-1's
-discovered token IDs (warm start). The CLIP transformer contextualizes
-the soft prompt, pools at EOS, and projects into joint space. The
-losses compare in joint space (where CLIP was trained). The discrete
-projection step (snap to nearest vocab embedding, with straight-
-through gradient) happens at each step or every k steps.
+The soft prompt is initialized directly from PEZ-1's `[N, 768]`
+embeddings (warm start, identity copy). The CLIP transformer
+contextualizes the soft prompt, pools at EOS, and projects into joint
+space. The L_instr loss compares pooled prompt against pooled
+instruction in joint space (where CLIP was trained). No vocabulary
+projection: the soft prompt is the optimization variable AND the
+final output.
 
 **Hyperparameters that need ablation in R2:**
 
@@ -660,60 +702,73 @@ through gradient) happens at each step or every k steps.
 - **`num_steps`**: fewer than PEZ-1 because we're refining, not
   searching from scratch. ~300–800 plausible.
 
-**What PEZ-2 outputs in our running examples:**
+**What PEZ-2 outputs in our running examples** (illustrated by
+projecting each position's embedding to its nearest CLIP vocabulary
+token for human readability — the canonical outputs are continuous
+`[N, 768]` tensors):
 
 For source image of a brown dog and instruction `"change the animal
 into a cat"`:
 ```
-PEZ-1 output:  [a, photo, of, a, fluffy, brown, dog, sitting, grass]
-PEZ-2 output:  [a, photo, of, a, fluffy, brown, cat, sitting, grass]
-                                         ^^^
-                            position 6 changed; rest preserved
+PEZ-1 (projected):  [a, photo, of, a, fluffy, brown, dog, sitting, grass]
+PEZ-2 (projected):  [a, photo, of, a, fluffy, brown, cat, sitting, grass]
+                                              ^^^
+                            position 6 drifted in 768-dim space;
+                            others stayed near PEZ-1's embeddings
 ```
 
 For instruction `"add a bowtie"`:
 ```
-PEZ-1 output:  [a, photo, of, a, fluffy, brown, dog, sitting, grass]
-PEZ-2 output:  [a, photo, of, a, fluffy, brown, dog, with, a, bowtie]
-                                                  ^^^^^^^^^^^^^^^^^^^
-                                          end positions changed/added
+PEZ-1 (projected):  [a, photo, of, a, fluffy, brown, dog, sitting, grass]
+PEZ-2 (projected):  [a, photo, of, a, fluffy, brown, dog, sitting, bowtie]
+                                                            ^^^^^^^^^^^^^^^
+                            one or two positions drifted to encode
+                            bowtie content (which positions depends on
+                            loss landscape, not always the trailing ones)
 ```
 
 For instruction `"turn its fur brown"` (suppose source had a black dog):
 ```
-PEZ-1 output:  [a, photo, of, a, fluffy, black, dog, sitting, grass]
-PEZ-2 output:  [a, photo, of, a, fluffy, brown, dog, sitting, grass]
-                                         ^^^^^
-                              attribute swapped; rest preserved
+PEZ-1 (projected):  [a, photo, of, a, fluffy, black, dog, sitting, grass]
+PEZ-2 (projected):  [a, photo, of, a, fluffy, brown, dog, sitting, grass]
+                                              ^^^^^
+                              attribute position drifted; rest stable
 ```
 
-These are illustrative — actual PEZ-2 outputs will depend on the
-optimization's convergence behavior, which R2 characterizes.
+These projections are illustrative; PEZ-2's actual `[N, 768]` outputs
+sit in continuous CLIP embedding space (often between vocabulary
+points, encoding visual specifics more precisely than any single
+discrete token would). R2 characterizes per-position drift patterns
+under different (λ, γ) settings.
 
 **The detail-richness advantage at large N.** A subtle but important
 property of this formulation: with a long prompt budget (large N),
 PEZ-2 automatically discovers visual properties of the desired edit
 that a user would not think to specify in a hand-crafted prompt.
 
-Consider an example:
+Consider an example (projected-to-vocab strings shown for readability;
+PEZ outputs are continuous embeddings that may sit between vocabulary
+points and encode visual specifics more precisely than any one token):
 
 ```
 Source image:    A photo of a black husky with thick fur on a wooden table.
 
-PEZ-1 (large N): "a high resolution photograph of a black husky with
-                  thick fur sitting on a wooden table under soft natural
-                  lighting"
+PEZ-1 (projected): "a high resolution photograph of a black husky with
+                    thick fur sitting on a wooden table under soft natural
+                    lighting"
 
-User instruction: "change the dog into a cat"
+User instruction:  "change the dog into a cat"
 
-PEZ-2 output:    "a high resolution photograph of a black bombay cat
-                  with long fur sitting on a wooden table under soft
-                  natural lighting"
+PEZ-2 (projected): "a high resolution photograph of a black bombay cat
+                    with long fur sitting on a wooden table under soft
+                    natural lighting"
 ```
 
 The breed `bombay` (a black, fluffy cat) is not something the user
-typed — they only said `"a cat"`. PEZ-2's joint optimization finds it
-automatically because:
+typed — they only said `"a cat"`. PEZ-2's joint optimization finds an
+embedding *near* "bombay" in CLIP space (likely even between vocabulary
+points, encoding "black-fluffy-cat-axis" more precisely than the
+single token "bombay") because:
 
 1. The **source-similarity term** in PEZ-2's loss is still active
    even after warm-start. It pulls the prompt toward describing the
@@ -748,32 +803,42 @@ known to provide.
 
 ### 3.3 P2P integration (sub-claim 3)
 
-**No modifications required.** This is a positive claim: existing
-P2P machinery composes with the PEZ-1 / PEZ-2 prompts unchanged.
-We verify this rather than building anything new on the attention-
-editing side.
+**Minimal modifications.** P2P's K/V swap mechanism operates on
+continuous CLIP hidden states and is agnostic to whether the prompt
+was produced by tokenization-from-text or by continuous-PEZ
+optimization. The only adapter needed is replacing LCS-over-token-IDs
+(the previous default in
+[cross_attention.py:64-80](attention_control/cross_attention.py#L64-L80))
+with **per-position cosine-distance alignment** between PEZ-1 and
+PEZ-2 embeddings. This is strictly simpler than LCS — no insertions,
+deletions, or reorderings to handle, since warm-start enforces
+identical length and per-position correspondence by construction.
 
 **Why it works.**
 
-- **Most positions match between PEZ-1 and PEZ-2 outputs** because
-  PEZ-2 is warm-started from PEZ-1 with a regularizer keeping it
-  close. Token-ID matching (used by LCS alignment in
-  [cross_attention.py:64-80](attention_control/cross_attention.py#L64-L80))
-  trivially maps shared positions.
-- **Positions where PEZ-1 and PEZ-2 differ are the edits** — they're
-  unmapped by P2P alignment. P2P leaves these positions alone (no
-  injection); they're free to attend organically to whatever the new
-  tokens semantically pull toward.
-- **The local-blend mask is built from cross-attention to the
+- **Same length, same per-position initialization** between PEZ-1 and
+  PEZ-2 (warm-start). Position `i` in source corresponds to position
+  `i` in target by construction. No alignment search needed.
+- **Per-position cosine distance** identifies which positions drifted
+  during PEZ-2's optimization:
+  ```
+  for i in range(N):
+      if cos_sim(pez_1_emb[i], pez_2_emb[i]) > τ:
+          matched.append(i)         # P2P injects source → target
+      else:
+          unmapped.append(i)        # P2P leaves alone; new content
+                                    # renders via target's organic
+                                    # cross-attention
+  ```
+  τ ≈ 0.95 (cosine similarity) is a reasonable starting point.
+- **The local-blend mask is built from cross-attention at the
   unmapped positions.** The mask spatially localizes where the edit
   should appear; outside the mask, source structure is preserved via
   P2P injection.
 
-**Refinements (Section 3.4) live at the input to CLIP.** Δ_i
-perturbations are applied when looking up token embeddings; the
-resulting input sequence is fed to CLIP's transformer, producing the
-77×768 contextual encoding. P2P operates on this contextual encoding
-without needing to know that some embeddings were refined.
+The threshold τ is the only new hyperparameter relative to the prior
+LCS design. LCS had implicit choices (gap penalties, tie-breaking);
+the cosine threshold replaces those with one explicit knob.
 
 **Why not classical mixture-of-experts.** A reasonable architectural
 alternative is composed classifier-free guidance (Liu et al. 2022):
@@ -797,42 +862,24 @@ We don't use this because:
    token positions as experts and local blend as spatial gating —
    matching SD's architecture natively.
 
-### 3.4 Bounded continuous refinement (sub-claim 4)
+### 3.4 Note on the prior "bounded refinement" phase
 
-**What it does.** Recovers fidelity beyond PEZ's discrete vocabulary
-ceiling without losing position-stability.
+A previous version of this proposal included a separate **bounded
+continuous refinement** phase that added small perturbations
+`Δ_i ∈ ℝ^768`, `||Δ_i|| ≤ ε`, to discrete-PEZ outputs in order to
+recover fidelity beyond what discrete vocabulary expressed. This
+phase is now subsumed by PEZ-1 and PEZ-2 themselves: with continuous
+optimization throughout, there is no discrete vocabulary ceiling to
+break out of, and per-position embeddings are already free to sit
+anywhere in `ℝ^768` from the start.
 
-**Mechanism.** For each PEZ-discovered token at position `i`, learn
-a perturbation `Δ_i ∈ ℝ^768` such that the refined embedding
-`e_{w_i} + Δ_i` better reconstructs the training image. Constrain
-`||Δ_i|| ≤ ε` either via hard projection after each gradient step or
-via a Lagrangian penalty `λ · ||Δ_i||²`.
-
-**Where refinement applies.**
-- **PEZ-1 outputs.** Refine source tokens to improve inversion
-  fidelity. Budget `ε_source` (e.g., 0.1).
-- **PEZ-2 outputs.** Refine target tokens for edit fidelity.
-  Budget `ε_target` (e.g., 0.1, possibly different from ε_source).
-
-**Where refined embeddings get applied at runtime.** At the input to
-CLIP's text encoder. Tokenize the prompt normally, look up each
-token's vocabulary embedding, then for tokens with refinements, add
-the Δ_i to the lookup. The resulting input embedding sequence (77 ×
-768) is fed to CLIP's transformer normally. The 77×768 contextual
-encoding it produces is what P2P sees.
-
-**The Pareto frontier.**
-- `ε = 0`: pure discrete. Position-stability automatic. Fidelity
-  bounded by vocabulary expressiveness.
-- `ε → ∞`: continuous textual inversion (in the limit). High
-  fidelity. Position-stability collapses (smearing returns).
-- Useful operating point: ε small enough that contextual-encoding
-  footprint stays concentrated at each token's position, but large
-  enough that fidelity meaningfully improves.
-
-Sub-claim 4's empirical question is whether such operating points
-exist for our use cases. The architecture works at ε=0 (no
-refinement) so this is a fidelity boost, not a load-bearing piece.
+The relevant fidelity-vs-stability lever is now PEZ-2's `γ_anchor`
+(L_anchor coefficient): high γ keeps embeddings near PEZ-1 (better
+P2P alignment, weaker edits); low γ allows larger drift (stronger
+edits, alignment risk). This is the same Pareto trade-off the prior
+ε knob was meant to characterize, expressed as a single parameter
+inside the existing optimization rather than as a separate
+post-processing phase.
 
 ### 3.5 Why this fixes additive editing
 
@@ -840,34 +887,42 @@ The two failure modes from Section 1's "Additive editing is the
 hardest case" subsection are addressed structurally:
 
 **Failure mode 1 (local-blend mask collapse) — fixed because:** PEZ-1
-and PEZ-2 outputs are real CLIP vocabulary tokens. CLIP was trained
-on captions; cross-attention to a vocabulary token at position `k` is
-what the model is built to handle, and the column is naturally
-spatially localized. The local-blend mask derived from this column
-inherits that locality.
+and PEZ-2 are optimized under a reconstruction-aware loss (SDS-CFG
+with null-text). The loss landscape rewards per-position embeddings
+whose cross-attention contributes constructively to recovering the
+source image — which means each position's cross-attention column
+ends up spatially localized rather than smeared. Vanilla TI doesn't
+have this property because it optimizes only for reconstruction at
+N=1; with no per-position structure to spread across, the single S*
+necessarily smears its contribution. With N≈15 and reconstruction
+gradient flowing through SD's U-Net, each position's cross-attention
+column is shaped to a coherent spatial role.
 
-**Failure mode 2 (P2P injection erasure) — fixed because:** PEZ-2's
-warm-start property means most positions in source and target are
-identical. Edits live at the positions where they differ — and at
-those positions, P2P sees mismatched token IDs and treats them as
-unmapped. Unmapped means P2P does NOT inject source content onto
+**Failure mode 2 (P2P injection erasure) — fixed because:** warm-
+start gives source and target the same length and per-position
+correspondence by construction. Edits live at the positions where
+PEZ-2's embedding drifted from PEZ-1's — and at those positions,
+per-position cosine distance exceeds the threshold τ, marking them
+*unmapped*. Unmapped means P2P does NOT inject source content onto
 target's column. The new content stays at its position, untouched
 by the alignment mechanism.
 
-For substitution edits (`dog → cat` swap):
-- Most source/target positions have matching tokens → P2P injects.
-- The swapped position has different tokens → unmapped → P2P leaves
-  alone → cat's organic cross-attention renders.
-
-For additive edits (`+ wearing a bowtie`):
-- Source positions stay matched to target's leading positions →
+For substitution edits (`dog → cat` semantic shift):
+- Most source/target positions have low cosine distance → matched →
   P2P injects.
-- Target's trailing positions don't exist in source → unmapped → free
-  to render new content.
+- The shifted position has high cosine distance → unmapped → P2P
+  leaves alone → cat-direction embedding's cross-attention renders.
+
+For additive edits (`+ a bowtie`):
+- Most positions stay at PEZ-1's embeddings (anchor pull) → matched.
+- One or two positions drift to encode bowtie content → unmapped →
+  free to render new content; cross-attention to those positions
+  drives the local-blend mask.
 
 In both cases, the architecture's correctness comes from the warm-
 start property keeping PEZ-2 close to PEZ-1 except where the
-instruction demands change.
+instruction demands change, and per-position cosine distance
+identifying that "except where" automatically.
 
 ### 3.6 Computational requirements summary
 
@@ -878,7 +933,6 @@ throughout. Three optimization procedures:
 |---|---|---|
 | PEZ-1 on a source image | ~15–30 min GPU | Per source image (cached) |
 | PEZ-2 (instruction-conditioned, warm-started) | ~5–10 min GPU | Per (image, instruction) pair |
-| Δ refinement (PEZ-1 and/or PEZ-2) | ~5–20 min GPU | Per refinement target (optional) |
 
 Per-edit total: ~20–40 min on first edit of a source image,
 ~5–15 min on subsequent edits of the same image (PEZ-1 cached).
@@ -900,38 +954,32 @@ Pipeline:
 PER-EDIT:
 
   1. PEZ-1 on source image (cached per source image):
-     image → discrete source tokens [w_s1, ..., w_sN]
-     Optional: bounded refinement → Δ_s1, ..., Δ_sN, ||Δ|| ≤ ε_source
+     image → continuous source embeddings src_emb [N, 768]
+     (also outputs per-timestep null_text)
 
   2. PEZ-2 on (source image, instruction), warm-started from PEZ-1:
-     - Initialize soft prompt at PEZ-1's vocabulary embeddings
-     - Optimize with joint loss:
-         L = -cos_sim(prompt_emb, image_emb)
-             -λ * cos_sim(prompt_emb, instruction_emb)
-             +γ * ||soft_prompt - soft_prompt_init||²
-     - Project to discrete tokens at convergence
-     → discrete target tokens [w_t1, ..., w_tM]
-       (M ≈ N for substitutions; M slightly > N for additions)
-     Optional: bounded refinement → Δ_t1, ..., Δ_tM, ||Δ|| ≤ ε_target
+     - Initialize soft prompt as src_emb.clone()
+     - Optimize with three-term loss:
+         L = L_source(soft_prompt, image, null_text)
+             + λ · L_instr(soft_prompt, instruction)
+             + γ · ||soft_prompt - soft_prompt_init||²
+     → continuous target embeddings tgt_emb [N, 768]
 
-  3. Encode both prompts through CLIP:
-     For each prompt:
-       - Tokenize → token IDs
-       - Look up vocabulary embeddings → input 77×768
-       - Add Δ_i at refined positions (if any)
-       - Run CLIP text-encoder transformer → 77×768 contextual encoding
+  3. Run each [N, 768] embedding sequence through CLIP's text encoder
+     (pad to 77 with EOS/padding tokens) → 77×768 contextual encoding
+     for source and target.
 
   4. DDIM-invert source image under source contextual encoding
      (use existing src/inversion.py)
 
-  5. Compute token mapping between source and target prompts:
-     - Positions where token IDs match → mapped (1:1)
-     - Positions where token IDs differ → unmapped (the edits)
-     - Positions in target only → unmapped (additions)
+  5. Per-position cosine alignment between src_emb and tgt_emb:
+     - matched   = [i if cos_sim(src_emb[i], tgt_emb[i]) > τ]
+     - unmapped  = [i if cos_sim(src_emb[i], tgt_emb[i]) ≤ τ]
+     τ ≈ 0.95 by default.
 
   6. Run editing denoising loop with [source, target] batch:
      - CrossAttentionController copies source attention columns to
-       target at mapped positions
+       target at matched positions
      - LocalBlend uses target_token_indices = unmapped positions to
        build a spatial mask; injection is gated by the mask outside
        its boundary
@@ -940,14 +988,17 @@ PER-EDIT:
 ```
 
 The crucial property: **all existing attention-editing machinery
-works unchanged.** PEZ-2's warm-start ensures source and target share
-most token IDs at the same positions; P2P alignment via token-ID
-matching is therefore trivial. The positions that differ are exactly
-the edit regions, and they're naturally identified as unmapped — which
-is what local blend needs to localize the edit.
+works unchanged at the K/V level.** Warm-start gives source and target
+the same length and per-position correspondence; per-position cosine
+distance produces the matched/unmapped partition that drives P2P and
+LocalBlend. The positions that drifted are exactly the edit regions,
+and they're naturally identified as unmapped — which is what local
+blend needs to localize the edit.
 
-No new attention controllers, no modifications to the existing
-denoising loop.
+The only adapter relative to the original P2P design: replace
+LCS-over-token-IDs with the per-position cosine threshold. No
+modifications to the K/V swap mechanism, the denoising loop, or
+LocalBlend itself.
 
 ## 4. Evaluation plan
 
@@ -959,12 +1010,10 @@ fidelity under three source-prompt strategies:
 - **BLIP-2 caption**: as in the v1 plan. Caption then DDIM-invert.
 - **Hand-crafted caption**: a human writes a careful description.
   Establishes a ceiling for caption-based methods.
-- **PEZ-discovered prompt**: the proposed source representation.
-- **PEZ + refined source tokens** at multiple ε ∈ {0.05, 0.1, 0.2}.
+- **PEZ-1 (continuous embeddings)**: the proposed source representation.
 
 Metrics: PSNR / SSIM / LPIPS on `recon = decode(reconstruct(invert(image,
-prompt)))`. Plus footprint concentration of refined source tokens to
-verify ε bounds are doing what we expect.
+prompt)))`.
 
 ### 4.2 PEZ-2 target prompt quality (sub-claim 2) — Knob 1: divergence
 
@@ -976,14 +1025,15 @@ time settings.
 For a fixed test set of 30 (source image, instruction) pairs covering
 substitution, addition, and attribute change, measure:
 
-- **Token preservation rate**: fraction of PEZ-1's tokens that appear
-  at the same position in PEZ-2's output. Higher = warm-start working.
+- **Per-position embedding stability**: fraction of positions where
+  cosine_similarity(pez_1_emb[i], pez_2_emb[i]) > τ for the
+  alignment threshold τ (0.95 default). Higher = warm-start working.
   Target: ≥70% for substitutions, ≥85% for additions (where most
   positions are unchanged).
 - **Edit semantic correctness** (human raters, paired comparisons):
-  does PEZ-2's output prompt describe an image satisfying the
-  instruction?
-- **CLIP similarity** between PEZ-2's output and a hand-crafted
+  does PEZ-2's output (projected to nearest vocab for inspection)
+  describe an image satisfying the instruction?
+- **CLIP similarity** between PEZ-2's pooled output and a hand-crafted
   ground-truth target prompt for each test case.
 - **(λ_instruction, γ_anchor) ablation**: sweep `λ_instruction ∈ {0.5,
   1.0, 2.0, 5.0}` and `γ_anchor ∈ {0.01, 0.1, 1.0}`. Report
@@ -1014,10 +1064,12 @@ Compare structural preservation (SSIM outside edit region) between
 the two. If PEZ-2 produces target prompts that compose with P2P
 as well as hand-crafted targets do, sub-claim 3 holds. If structural
 preservation degrades with PEZ-2 vs. hand-crafted, the issue is
-PEZ-2 producing target prompts whose token structure doesn't align
-cleanly under LCS — investigate.
+PEZ-2 producing target prompts whose per-position drift pattern
+doesn't align cleanly under cosine-threshold alignment — investigate
+threshold τ, drift uniformity across positions, or per-position
+L_anchor weighting.
 
-### 4.4 End-to-end editing quality (sub-claim 4) — Knob 2: edit aggressiveness
+### 4.4 End-to-end editing quality — Knob 2: edit aggressiveness
 
 End-to-end editing quality with the full architecture vs. baselines,
 plus a sweep over **Knob 2** — `(cross_replace_steps, self_replace_steps)`
@@ -1047,8 +1099,9 @@ Knob-2 setting only):
 
 - **BLIP-2 caption + hand-crafted target + P2P**: human-in-the-loop
   ceiling for caption-based editing.
-- **Continuous TI + P2P (broken baseline)**: continuous textual
-  inversion injected at target positions.
+- **Vanilla TI + P2P (broken baseline)**: TI's N=1 continuous concept
+  injected at the target position; no warm-start anchor, no per-
+  position structure.
 - **InstructPix2Pix** (Brooks et al. 2023): instruction-trained
   end-to-end editing model.
 
@@ -1064,7 +1117,7 @@ Knob-2 setting only):
 
 **Hypothesis.**
 
-- Proposed method at moderate Knob-2 beats continuous TI + P2P
+- Proposed method at moderate Knob-2 beats vanilla TI + P2P
   decisively on additive edits.
 - Proposed method matches or beats InstructPix2Pix on structure
   preservation. Concept fidelity should be comparable.
@@ -1176,26 +1229,30 @@ doesn't just match what a user could do — it can do better than
 naive user prompts because it has automatic access to all of the
 source image's visual properties via the CLIP source-similarity term.
 
-### 4.7 P2P alignment robustness on PEZ-derived prompts
+### 4.7 Per-position alignment robustness on PEZ-derived prompts
 
-PEZ-1 and PEZ-2 may produce token sequences with unusual orderings.
-Verify that P2P's LCS alignment still produces sensible mappings:
+Verify that the per-position cosine threshold (default τ ≈ 0.95)
+produces sensible matched/unmapped partitions on PEZ-2 outputs:
 
-- Source is PEZ-1-discovered (unusual token order)
+- Source is PEZ-1-discovered (continuous embeddings, possibly far
+  from any vocabulary point)
 - Target is PEZ-2-discovered, warm-started from PEZ-1 (mostly aligned
-  but some positions differ)
-- Multi-attribute edits where multiple positions differ between source
+  but some positions drifted)
+- Multi-attribute edits where multiple positions drift between source
   and target
 
-Failure mode: PEZ chooses common stop-words at multiple positions,
-causing LCS to align them ambiguously. If observed, replace LCS with
-a CLIP-embedding-based semantic aligner (see Appendix B).
+Failure mode: many positions drift slightly under PEZ-2's optimization
+even at unaffected positions, producing a noisy unmapped set. If
+observed, increase γ_anchor to keep unaffected positions tightly
+anchored, or sweep τ to find the elbow that cleanly separates "drifted
+for the edit" from "drifted incidentally."
 
 ## 5. Codebase organization
 
-New code lives under `src/pez/`, `src/refinement/`, `src/splice/`.
-Existing code (`src/inversion.py`, `attention_control/`,
-`src/utils.py`) is reused unchanged.
+New code lives under `src/pez/`, `src/splice/`. Existing code
+(`src/inversion.py`, `attention_control/`, `src/utils.py`) is reused
+unchanged at the K/V level; only the alignment helper is replaced
+(LCS-over-IDs → per-position cosine threshold).
 
 Proposed layout:
 
@@ -1203,33 +1260,24 @@ Proposed layout:
 src/
   pez/
     __init__.py
-    search.py             # core PEZ algorithm: soft prompt + projection
+    search.py             # core PEZ algorithm: soft prompt + AdamW
+                          # (no vocabulary projection; soft prompt = output)
                           # used by both source_inversion and instruction_conditioned
-    source_inversion.py   # PEZ-1: image → discrete source prompt
+    source_inversion.py   # PEZ-1: image → continuous source embeddings [N, 768]
                           # (caches outputs per image hash)
     instruction_conditioned.py
-                          # PEZ-2: (image, instruction) → discrete target prompt
-                          # warm-started from PEZ-1, with joint loss + γ regularizer
-
-  refinement/
-    __init__.py
-    delta.py              # learnable Δ_i perturbation per token
-    train.py              # bounded refinement training loop
-                          # (Lagrangian or hard-projection ε constraint)
-                          # applies to both PEZ-1 and PEZ-2 outputs
+                          # PEZ-2: (image, instruction) → continuous target embeddings
+                          # [N, 768]; warm-started from PEZ-1, three-term joint loss
 
   splice/
     __init__.py
-    encode_with_refinement.py
-                          # tokenize a prompt, look up embeddings,
-                          # add Δ at refined positions, run CLIP transformer
-    align.py              # token-ID matching between source and target prompts;
-                          # returns (mapping, unmapped_target_indices)
+    align.py              # per-position cosine-distance alignment
+                          # between source and target embeddings;
+                          # returns (matched_indices, unmapped_target_indices)
 
   metrics/
     __init__.py
     fidelity.py           # PSNR / SSIM / LPIPS of inversion+reconstruction
-    footprint.py          # contextual-encoding footprint concentration
     edit_quality.py       # structure preservation, concept fidelity (CLIP),
                           # mask quality (IoU vs ground-truth edit region)
 
@@ -1238,11 +1286,10 @@ attention_control/
 
 notebooks/
   R1_pez_source.ipynb        # PEZ-1 vs. BLIP-2 captioning fidelity comparison
-  R2_pez_instruction.ipynb   # PEZ-2 ablation of (λ, γ); token preservation
-                             # rate; edit semantic correctness
-  R3_refinement_pareto.ipynb # bounded refinement ε ablation
+  R2_pez_instruction.ipynb   # PEZ-2 ablation of (λ, γ); per-position embedding
+                             # stability; edit semantic correctness
   R4_full_evaluation.ipynb   # end-to-end editing comparison vs.
-                             # IP2P, continuous TI, caption baselines
+                             # IP2P, vanilla TI, caption baselines
 
 data/
   test_images/               # held-out source images for editing
@@ -1254,70 +1301,65 @@ data/
                              # human-written target prompts for evaluation
 
 cache/
-  pez_source_prompts/        # cached PEZ-1 outputs per source image
-                             # (each PEZ-1 run is ~15-30min; cache aggressively)
+  pez_source_prompts/        # cached PEZ-1 outputs ([N, 768] tensors) per
+                             # source image (each PEZ-1 run ~15-30min)
   pez_target_prompts/        # cached PEZ-2 outputs per (image, instruction)
-                             # (each PEZ-2 run is ~5-10min; cache when possible)
-  refined_deltas/            # cached Δ refinements
+                             # (each PEZ-2 run ~5-10min)
 ```
 
-The three library directories (`pez/`, `refinement/`, `splice/`) form
-a clean separation: PEZ produces discrete token sequences (used both
-for source inversion and instruction-conditioned target generation),
-refinement produces optional small perturbations, splice assembles
-prompts and aligns them for P2P. Each is independently testable.
+The two library directories (`pez/`, `splice/`) form a clean
+separation: PEZ produces continuous embedding sequences (used both
+for source inversion and instruction-conditioned target generation);
+splice aligns them for P2P. Each is independently testable.
 
 ## 6. Existing-code reuse map
-
-Existing code in the repo is reused unchanged except for adding the
-LocalBlend module needed by R4.
 
 | Component | Status | When needed |
 |---|---|---|
 | Existing inversion (DDIM + null-text) in `src/inversion.py` | Required, unchanged | All phases that involve image reconstruction. |
-| Existing attention controllers (P2P) in `attention_control/` | Required, unchanged | Phase R4. The architectural claim is that these continue to work unchanged when fed PEZ-derived prompts. |
+| Existing attention controllers (P2P) in `attention_control/` | Required, K/V-swap mechanism unchanged; alignment helper replaced (LCS-over-IDs → per-position cosine threshold) | Phase R4. K/V swap operates on continuous CLIP hidden states regardless of how the prompt was produced. |
 | Existing SD utility code in `src/utils.py` | Required, unchanged | All phases. |
 | New: `attention_control/local_blend.py` | Required (built when starting R4) | Phase R4. Specification in Appendix A. |
-| New: `src/semantic_alignment.py` | Optional fallback for R4 | Only if LCS alignment proves insufficient for PEZ outputs. Specification in Appendix B. |
+| New: `src/splice/align.py` | Required for R4 | Per-position cosine-distance alignment between PEZ-1 and PEZ-2 embeddings. |
 | BLIP-2 captioning wrapper | Used as R1 baseline only | A minimal BLIP-2 wrapper for the source-fidelity comparison in R1. Not part of the proposed pipeline; exists only for the comparison. |
-
-The research never modifies existing code; it only adds new modules.
 
 ## 7. Phased experimental milestones
 
-The project breaks into four phases, each producing a discrete artifact.
+The project breaks into three phases, each producing a discrete
+artifact. (A previous version had a fourth "bounded refinement" phase;
+that is now subsumed by PEZ-1's continuous optimization — see §3.4.)
 
 ### Phase R1 — PEZ on the source image (sub-claim 1)
 
-**Goal:** a working PEZ implementation that takes a source image and
-produces a discrete CLIP-vocabulary prompt, plus measurements showing
-PEZ-discovered prompts give higher inversion fidelity than BLIP-2
-captions.
+**Goal:** a working continuous-PEZ implementation that takes a source
+image and produces an `[N, 768]` continuous embedding tensor, plus
+measurements showing PEZ-1 embeddings give higher inversion fidelity
+than BLIP-2 captions.
 
 **Files to create:**
 
 - `src/pez/search.py`
   ```python
   def pez_search(
-      target: Image.Image | list[Image.Image],
-      clip_model,
-      tokenizer,
-      prompt_length: int = 8,
-      num_steps: int = 1500,
-      lr: float = 0.1,
+      loss_fn,                                  # callable(soft_prompt) → scalar
+      prompt_length: int,
+      num_steps: int,
+      lr: float,
+      seed: int,
       device: torch.device,
-  ) -> list[int]:
-      """Run PEZ optimization (Wen et al. 2023). Returns CLIP vocab
-      token IDs that maximize CLIP-image similarity to the target.
+      initial_soft_prompt: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+      """Run continuous PEZ optimization. Returns the final soft prompt
+      [prompt_length, 768] in CLIP embedding space.
 
       Algorithm:
-        - Initialize a [prompt_length, 768] soft prompt randomly.
+        - Initialize a [prompt_length, 768] soft prompt
+          (random, or warm-started from initial_soft_prompt).
         - For num_steps:
-          - Project soft prompt to nearest vocabulary tokens (hard).
-          - Compute CLIP loss between soft prompt encoding and target
-            image embedding.
-          - Backprop through projection (straight-through estimator).
-          - Update soft prompt via Adam.
+          - Compute loss = loss_fn(soft_prompt).
+          - Backprop directly to soft_prompt (no vocabulary projection).
+          - AdamW step on soft_prompt.
+        - Return final soft_prompt as the canonical output.
       """
   ```
 - `src/pez/source_inversion.py`
@@ -1326,12 +1368,16 @@ captions.
       image: Image.Image,
       clip_model,
       tokenizer,
-      prompt_length: int = 8,
+      prompt_length: int = 15,
       num_steps: int = 1500,
       cache_dir: Path | None = None,
-  ) -> str:
-      """PEZ on a single source image. Returns a string prompt
-      decoded from discovered token IDs. Caches to disk by image hash.
+  ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+      """PEZ-1 on a single source image. Returns:
+        - source_embeddings: Tensor[N, 768], continuous CLIP-input
+          embeddings that reconstruct the source under our pipeline
+        - null_text_per_timestep: per-timestep optimized null-text
+          (list of T tensors, each [1, 77, 768])
+      Caches to disk by image hash.
       """
   ```
 - `src/metrics/fidelity.py`
@@ -1347,8 +1393,9 @@ captions.
 
 **What to produce:**
 
-- A working PEZ implementation, validated on a few test images.
-- 10 source images with cached PEZ prompts in
+- A working continuous-PEZ implementation, validated on a few test
+  images.
+- 10 source images with cached PEZ-1 embeddings in
   `cache/pez_source_prompts/`.
 - A comparison table per source image:
 
@@ -1356,23 +1403,24 @@ captions.
   |---|---|---|---|
   | BLIP-2 caption | ... | ... | ... |
   | Hand-crafted caption (ceiling) | ... | ... | ... |
-  | PEZ-discovered prompt | ... | ... | ... |
+  | PEZ-1 (continuous embeddings) | ... | ... | ... |
 
 **Expected finding:**
 
-PEZ-discovered prompts give comparable or better inversion fidelity
-than BLIP-2 captions, particularly on images with hard-to-describe
-content (specific patterns, unusual compositions, fine textures).
-Hand-crafted captions remain the ceiling but require human effort.
+PEZ-1 embeddings give comparable or better inversion fidelity than
+BLIP-2 captions, particularly on images with hard-to-describe content
+(specific patterns, unusual compositions, fine textures). Hand-crafted
+captions remain the ceiling but require human effort.
 
-If PEZ doesn't beat BLIP-2 (sub-claim 1 fails), pivot: fall back to
+If PEZ-1 doesn't beat BLIP-2 (sub-claim 1 fails), pivot: fall back to
 BLIP-2 captioning for source representation. PEZ-2 (R2 onward) still
 works on top of caption-derived sources — it just becomes "PEZ-2 from
 a caption" instead of "PEZ-2 from PEZ-1". The architecture survives;
 the source-representation contribution is reduced.
 
 Estimated time: 1-2 weeks. Mostly adapting Wen et al.'s PEZ codebase
-to integrate with the existing inversion pipeline.
+to integrate with the existing inversion pipeline (without the
+straight-through vocabulary projection).
 
 ---
 
@@ -1389,37 +1437,41 @@ with end-to-end edits on a few hand-picked test cases.
   def pez_instruction_conditioned(
       source_image: Image.Image,
       instruction: str,
-      pez1_tokens: list[int],          # warm-start from PEZ-1
+      pez1_embeddings: torch.Tensor,    # [N, 768] from PEZ-1
+      null_text: torch.Tensor,          # frozen, from PEZ-1
       clip_model,
-      tokenizer,
+      sd_pipeline,
       lambda_instr: float = 1.0,        # instruction strength
       gamma: float = 0.1,               # warm-start anchor
       num_steps: int = 500,
-  ) -> list[int]:
-      """PEZ-2: optimize a soft prompt warm-started from pez1_tokens
-      with joint CLIP-image and CLIP-instruction similarity losses,
-      plus an L2 regularizer pulling the soft prompt back toward its
-      initialization.
+  ) -> torch.Tensor:
+      """PEZ-2: optimize a soft prompt warm-started from pez1_embeddings
+      with three-term loss (SDS-CFG source preservation + text-text
+      CLIP cosine to instruction + L2 anchor to warm-start).
 
       Loss:
-        L = -cos_sim(prompt_emb, image_emb)
-            -lambda_instr * cos_sim(prompt_emb, instr_emb)
-            +gamma * ||soft_prompt - soft_prompt_init||^2
+        L = L_source(soft_prompt, image, null_text)         # SDS-CFG
+            + lambda_instr * (-cos_sim(pooled_prompt, instr_emb))
+            + gamma * ||soft_prompt - soft_prompt_init||^2
 
-      Returns the discrete token IDs after final projection."""
+      Returns: continuous target embeddings [N, 768]."""
   ```
 - `src/splice/align.py`
   ```python
   def align_pez_prompts(
-      source_token_ids: list[int],
-      target_token_ids: list[int],
-  ) -> tuple[dict[int, int], list[int]]:
-      """LCS-based alignment between source and target token sequences.
+      source_embeddings: torch.Tensor,  # [N, 768]
+      target_embeddings: torch.Tensor,  # [N, 768]
+      threshold: float = 0.95,          # cosine similarity cutoff
+  ) -> tuple[list[int], list[int]]:
+      """Per-position cosine-distance alignment between source and
+      target embeddings. Warm-start makes both sequences the same
+      length with per-position correspondence by construction.
 
       Returns:
-        - mapping: {source_pos: target_pos} for matched token IDs
-        - unmapped_target_indices: target positions with no source match
-          (these drive local blend in editing)"""
+        - matched_indices: positions where cos_sim >= threshold
+          (P2P will inject source K/V here)
+        - unmapped_target_indices: positions where cos_sim < threshold
+          (P2P leaves alone; these drive LocalBlend)"""
   ```
 
 **What to produce:**
@@ -1429,7 +1481,8 @@ with end-to-end edits on a few hand-picked test cases.
   prompts.
 - A (λ, γ) ablation grid: for each test case, sweep λ ∈ {0.5, 1.0,
   2.0, 5.0} and γ ∈ {0.01, 0.1, 1.0}. Report:
-  - Token preservation rate (PEZ-1 vs. PEZ-2 token-ID overlap)
+  - Per-position embedding stability (fraction of positions where
+    cos_sim(pez_1_emb[i], pez_2_emb[i]) > τ for τ=0.95)
   - Edit semantic correctness (human/CLIP score against expected target)
 - Recommended (λ, γ) operating range for each edit type
   (substitution / addition / attribute change / style change).
@@ -1454,83 +1507,7 @@ Estimated time: 2 weeks.
 
 ---
 
-### Phase R3 — Bounded continuous refinement (sub-claim 4)
-
-**Goal:** add the continuous refinement layer; characterize the Pareto
-frontier between fidelity and position-stability for both PEZ-1 and
-PEZ-2 outputs.
-
-**Files to create:**
-
-- `src/refinement/delta.py`
-  ```python
-  class TokenRefinements:
-      """Manages a list of [768] perturbation tensors, one per refined
-      token position.
-
-      Provides:
-        - parameters() for optimizer (the Δ_i tensors)
-        - apply(input_embeddings, positions): adds Δ_i at positions
-          inside a [1, 77, 768] input embedding tensor
-        - epsilon_clip(): hard-projects each Δ_i to ||Δ|| ≤ ε
-          (alternative to a Lagrangian penalty)
-      """
-  ```
-- `src/refinement/train.py`
-  ```python
-  def refine_embeddings(
-      target_images: list[Image.Image],
-      base_token_ids: list[int],
-      pipeline,
-      epsilon: float = 0.1,
-      num_steps: int = 1000,
-      lr: float = 1e-4,
-      method: Literal["projection", "lagrangian"] = "projection",
-  ) -> list[torch.Tensor]:
-      """Train Δ_i for each token in base_token_ids such that
-      e_{w_i} + Δ_i better reconstructs target_images, subject to
-      ||Δ_i|| ≤ ε."""
-  ```
-- `src/splice/encode_with_refinement.py`
-  ```python
-  def encode_prompt_with_refinement(
-      prompt: str,
-      tokenizer,
-      text_encoder,
-      refinements: dict[int, torch.Tensor],   # {position: Δ}
-  ) -> torch.Tensor:
-      """Tokenize prompt; look up vocabulary embeddings; add Δ at
-      specified positions; run CLIP transformer; return [1, 77, 768]
-      contextual encoding.
-
-      THE core integration point: where discrete tokens + bounded
-      refinements meet the encoder pipeline."""
-  ```
-
-**What to produce:**
-
-- A refinement implementation usable for both PEZ-1 outputs (source
-  tokens) and PEZ-2 outputs (target tokens).
-- Pareto curves: x = footprint concentration, y = reconstruction
-  fidelity, one point per ε ∈ {0, 0.05, 0.1, 0.2, 0.5, 1.0}.
-- Recommended operating ε, selected as the largest ε at which
-  footprint concentration stays above 0.7 (or some chosen stability
-  threshold).
-
-**Expected finding:**
-
-A useful Pareto frontier exists at ε ≈ 0.1 giving meaningful fidelity
-improvement while keeping footprint concentration in the 0.7–0.9 range.
-
-If no useful frontier exists (sub-claim 4 fails), operate at ε = 0
-(pure discrete). Architecture still works, just with PEZ's known
-fidelity ceiling. Refinement is optional, not load-bearing.
-
-Estimated time: 2 weeks.
-
----
-
-### Phase R4 — End-to-end editing evaluation (sub-claim 4 + paper)
+### Phase R4 — End-to-end editing evaluation (paper-grade)
 
 **Goal:** end-to-end editing experiments with the full PEZ-1 + PEZ-2
 + P2P architecture vs. baselines; paper-grade writeup.
@@ -1546,19 +1523,20 @@ Estimated time: 2 weeks.
 
 For each of 50 (source image, instruction) pairs:
 
-1. Load cached PEZ-1 source prompt (from R1) and run PEZ-2 (from R2)
-   to get target prompt. Apply optional refinements (from R3).
-2. Encode source and target prompts through CLIP with refinements
-   applied at input.
+1. Load cached PEZ-1 source embeddings (from R1) and run PEZ-2 (from
+   R2) to get target embeddings.
+2. Encode source and target prompts through CLIP's text encoder
+   directly from their `[N, 768]` continuous embeddings.
 3. DDIM-invert source under source encoding.
-4. Compute LCS alignment between source and target token IDs.
+4. Compute per-position cosine alignment between source and target
+   embeddings.
 5. Set up controllers:
-   - `CrossAttentionController` with the LCS mapping
-   - `LocalBlend` with `target_token_indices` = unmapped target positions
+   - `CrossAttentionController` with the matched/unmapped partition
+   - `LocalBlend` with `target_token_indices` = unmapped positions
 6. Run editing denoising loop.
 7. Save side-by-side comparisons:
    - Source image
-   - Edit using **continuous TI + P2P** (broken baseline)
+   - Edit using **vanilla TI + P2P** (broken baseline)
    - Edit using **InstructPix2Pix** (instruction-trained baseline)
    - Edit using **BLIP-2 + hand-crafted target + P2P** (human ceiling)
    - Edit using **proposed (PEZ-1 + PEZ-2 + P2P)**
@@ -1571,13 +1549,13 @@ For each of 50 (source image, instruction) pairs:
   - Without PEZ-1 (use BLIP-2 source instead)
   - Without PEZ-2 (use hand-crafted target instead) — measures how
     much PEZ-2 contributes vs. just having a good source representation
-  - Without refinement (ε=0 everywhere)
+  - Cosine threshold τ ablation
 - Qualitative figure for the paper.
 - Paper draft: motivation, method, results, related work, limitations.
 
 **Expected finding:**
 
-Proposed architecture beats continuous-TI baseline decisively on
+Proposed architecture beats vanilla-TI baseline decisively on
 additive edits, matches/beats InstructPix2Pix on structure
 preservation, and approaches the BLIP-2 + hand-crafted ceiling on edit
 quality (showing PEZ-2 successfully automates the human's role).
@@ -1586,10 +1564,10 @@ Estimated time: 3–4 weeks including writeup iteration.
 
 ---
 
-**Total estimated timeline: 7-9 weeks of focused work.**
+**Total estimated timeline: 5-7 weeks of focused work.**
 
-A reasonable milestone cadence: R1 done by week 1, R2 by week 3, R3
-by week 5, R4 by weeks 6-9.
+A reasonable milestone cadence: R1 done by week 1, R2 by week 3,
+R4 by weeks 4-7.
 
 ## 8. Open research questions
 
@@ -1641,21 +1619,30 @@ they shape the methodology:
    both signals), or sequence as two PEZ-2 runs? Probably the latter
    for cleaner alignment, but worth comparing.
 
-5. **Vocabulary biasing during PEZ search.** Restricting PEZ's
-   vocabulary to common edit-friendly words might help PEZ-2 produce
-   more sensible target prompts (since the warm start is more natural).
-   Worth ablating.
+5. **Cosine alignment threshold τ.** Default τ = 0.95 is heuristic.
+   Worth sweeping τ ∈ {0.90, 0.95, 0.97, 0.99} on the test set to
+   find the elbow that cleanly separates "drifted for the edit" from
+   "drifted incidentally."
 
 6. **SDS stability.** DreamFusion-style SDS has known issues
    (over-saturation, mode collapse, sensitivity to timestep sampling).
-   For PEZ — which optimizes a finite vocabulary projection of a soft
-   prompt rather than continuous pixels — these issues may manifest
-   differently. Worth measuring and possibly mitigating with VSD
-   (Variational Score Distillation, Wang et al. 2023) if vanilla
+   For continuous-PEZ — which optimizes a soft prompt in CLIP-input
+   embedding space rather than continuous pixels — these issues may
+   manifest differently. Worth measuring and possibly mitigating with
+   VSD (Variational Score Distillation, Wang et al. 2023) if vanilla
    SDS proves unstable.
 
-7. **Refinement budget allocation.** Two ε values to tune — one for
-   PEZ-1, one for PEZ-2. Should they be coupled, or independent?
+7. **Off-distribution risk for CLIP/SD on continuous prompts.** CLIP's
+   text encoder was trained on inputs that are at vocabulary points;
+   continuous PEZ prompts can drift to arbitrary points in CLIP-input
+   embedding space. TI demonstrates this works in practice (the
+   manifold is locally smooth), but PEZ-2's instruction-conditioned
+   joint loss may push the prompt to less-tested regions. Mitigation:
+   monitor per-position L2 distance from the nearest vocabulary
+   embedding as a sanity diagnostic; raise alarm if average distance
+   exceeds typical TI operating ranges. L_anchor partly hedges
+   against this by keeping the prompt near PEZ-1's converged
+   embeddings.
 
 8. **Interaction with P+ / per-layer textual inversion.** P+ (Voynov
    et al. 2023) shows per-layer embeddings capture concepts more
@@ -1775,9 +1762,10 @@ above (substitution, addition, attribute change, style change), but
 - **Identity-preserving edits across large semantic changes** —
   `"the same person but as a child"`. Identity preservation through
   large CLIP-distance moves is a separate research thread (DreamBooth,
-  Textual Inversion, identity-locking LoRAs); the discrete-token
-  inversion in PEZ-1 doesn't carry per-instance identity strongly
-  enough for this.
+  Textual Inversion, identity-locking LoRAs); PEZ-1's continuous
+  embedding inversion captures identity well at *small* CLIP-distance
+  moves but doesn't carry per-instance identity strongly enough for
+  large semantic shifts.
 
 The `LocalBlend` mask gives gentle help on **additive** P2P edits
 (masks the target's new content from being overwritten by source
@@ -1793,25 +1781,25 @@ inpainting (for pixel-precise region edits).
 
 | Method | What it does | Why it doesn't solve our problem |
 |---|---|---|
-| **PEZ / Hard Prompts Made Easy** (Wen 2023) | Discrete prompt search for image-to-text inversion | Foundation we build on; not previously applied as a source-representation primitive for attention-based editing, nor extended to instruction-conditioned target generation |
-| **Textual Inversion** (Gal 2022) | Learns single continuous-token concept embeddings | Continuous embeddings smear across contextual encodings, breaking P2P alignment; we use discrete tokens specifically to avoid this |
+| **PEZ / Hard Prompts Made Easy** (Wen 2023) | Soft-prompt optimization with straight-through projection to CLIP vocabulary | We adopt the optimization machinery (soft prompt + AdamW + gradient through CLIP/SD) but drop the vocabulary projection — soft prompt is the canonical output. Wen et al. didn't apply PEZ as a source-representation primitive for attention-based editing, nor extend it to instruction-conditioned target generation, nor pair it with a reconstruction-aware SDS-CFG loss. |
+| **Textual Inversion** (Gal 2022) | Learns one continuous-token concept embedding via image-text reconstruction | TI optimizes one 768-dim vector for a concept — no per-position structure, no instruction conditioning, no alignment story for downstream editing. Our design extends to N≈15 vectors with: (a) reconstruction-aware SDS-CFG loss tied to the editing pipeline, (b) instruction-conditioned target generation pass with warm-start anchor, (c) per-position cosine-distance alignment for P2P composition. The single-vector design is what made TI not compose with P2P; our N-vector + warm-start design directly addresses that. |
 | **DreamBooth** (Ruiz 2022) | Fine-tunes the U-Net for a specific concept | Modifies model weights; concept not transportable via prompt manipulation |
 | **InstructPix2Pix** (Brooks 2023) | Trains a diffusion model end-to-end for instruction-conditioned image editing | Replaces P2P entirely; requires bootstrapped training data via GPT-3; produces a black-box editing model rather than a compositional pipeline |
 | **Composable Diffusion** (Liu 2022) | Combines multiple text conditionings via composed CFG | Generates from scratch — no source structure preservation. Wouldn't compose with our P2P setup without adding the same machinery anyway |
 | **Custom Diffusion** (Kumari 2022) | Optimizes K/V projections per concept | Composition lives in projection space; doesn't compose with P2P's prompt-side column-swap mechanism |
-| **P+** (Voynov 2023) | Per-layer textual inversion | Orthogonal — could combine with PEZ for richer per-layer discrete representations (Open Question 6) |
+| **P+** (Voynov 2023) | Per-layer textual inversion | Orthogonal — could combine with continuous PEZ for richer per-layer representations (Open Question 8) |
 | **Concept Sliders** (Gandikota 2023) | Trains directional axes between concepts | Different abstraction (continuous attribute axes); uses LoRAs not prompts |
 | **Mix-of-Show** (Gu 2023) | LoRA fusion across multiple concepts | LoRA-level composition, not prompt-level |
-| **Prompt-to-Prompt** (Hertz 2022) | Cross-attention column swap for editing | Built for natural-language prompts; this proposal extends its applicability to PEZ-derived prompts via the discrete-token-anchor argument |
-| **BLIP-2 captioning** (Li 2023) | Image-to-text via caption | Used as a baseline; PEZ-1 replaces it for source representation, with PEZ optimizing CLIP-image similarity directly |
+| **Prompt-to-Prompt** (Hertz 2022) | Cross-attention column swap for editing | Built for natural-language prompts. This proposal extends its applicability to PEZ-derived continuous prompts via per-position warm-start correspondence (alignment falls out of warm-start, not out of token-ID equality). |
+| **BLIP-2 captioning** (Li 2023) | Image-to-text via caption | Used as a baseline; PEZ-1 replaces it for source representation, with continuous-PEZ optimizing reconstruction directly under the editing pipeline |
 
 The contribution is **the two-PEZ architecture for instruction-
 conditioned editing** — PEZ-1 for source representation, PEZ-2 for
 instruction-conditioned target generation, both composing with existing
-P2P machinery unchanged. The instruction-following step is
-embedding-space optimization (PEZ-2's joint loss) rather than parsing
-or LLM-based reasoning. No cited method does this — each solves a
-related but distinct piece.
+P2P machinery via per-position warm-start correspondence. The
+instruction-following step is embedding-space optimization (PEZ-2's
+joint loss) rather than parsing or LLM-based reasoning. No cited
+method does this — each solves a related but distinct piece.
 
 ## 10. What success looks like
 
@@ -1828,33 +1816,42 @@ A demo where:
 2. The user provides a natural-language instruction:
    `"change the animal into a cat"`.
 3. The pipeline:
-   - **PEZ-1** runs on the source image with N=15 → discrete source
-     tokens that capture the source's visual details, e.g.
-     `["a", "high", "resolution", "photograph", "of", "a", "black",
-     "husky", "with", "thick", "fur", "on", "a", "wooden", "table"]`.
+   - **PEZ-1** runs on the source image with N=15 → continuous
+     source embeddings `[15, 768]` that capture the source's visual
+     details. Projected to nearest vocabulary for human inspection
+     this might read like `["a", "high", "resolution", "photograph",
+     "of", "a", "black", "husky", "with", "thick", "fur", "on", "a",
+     "wooden", "table"]` — but the canonical artifact is the
+     continuous tensor.
    - **PEZ-2** runs on `(source image, instruction)`, warm-started
-     from PEZ-1's tokens, with the joint loss:
+     from PEZ-1's embeddings, with the three-term joint loss:
      ```
-     L = -cos_sim(prompt, image) - λ·cos_sim(prompt, instruction)
-         + γ·||soft_prompt - init||²
+     L = L_source(soft_prompt, image, null_text)        # SDS-CFG
+         + λ · (-cos_sim(pooled_prompt, pooled_instr))  # text-text
+         + γ · ||soft_prompt - soft_prompt_init||²
      ```
      The instruction's CLIP encoding is dominated by `"cat"`. The
-     joint optimization finds tokens that satisfy:
-     - Most positions stay at PEZ-1's tokens (warm-start anchor)
-     - Some position shifts toward "cat" (instruction term)
-     - The chosen cat must visually match the source — black, thick
-       fur, large breed (source-similarity term)
-     
-     Result: `["a", "high", "resolution", "photograph", "of", "a",
-     "black", "bombay", "with", "long", "fur", "on", "a", "wooden",
-     "table"]`. The breed `bombay` (a black, fluffy cat) was *not*
-     in the user's instruction. PEZ-2 found it by satisfying source
-     visual properties simultaneously with instruction semantics.
+     joint optimization finds embeddings that satisfy:
+     - Most positions stay near PEZ-1's embeddings (warm-start anchor)
+     - One or two positions drift in 768-dim space toward cat-cluster
+       (instruction term)
+     - The chosen direction in cat-cluster must visually match the
+       source — black, thick fur, large breed (source-similarity term)
+
+     Result projected to nearest vocab: `["a", "high", "resolution",
+     "photograph", "of", "a", "black", "bombay", "with", "long",
+     "fur", "on", "a", "wooden", "table"]`. The breed `bombay` (a
+     black, fluffy cat) was *not* in the user's instruction. PEZ-2
+     found an embedding near it (likely between vocabulary points,
+     even more visually-precise than `bombay` exactly) by satisfying
+     source visual properties simultaneously with instruction
+     semantics.
    - DDIM-inverts the photo under PEZ-1's source encoding.
-   - Runs P2P edit. Token-ID matching aligns most positions; 
-     the differing positions (`husky → bombay`, `thick → long`) are
-     unmapped → drive the local-blend mask. P2P injects at unchanged
-     positions, preserving the source's structural skeleton.
+   - Runs P2P edit. Per-position cosine alignment marks most positions
+     as matched (cosine ≥ τ); the drifted positions (`husky → bombay`,
+     `thick → long`) are unmapped → drive the local-blend mask. P2P
+     injects at matched positions, preserving the source's structural
+     skeleton.
 4. Output: **the same composition, in the same pose, on the same
    wooden table, with a black fluffy bombay cat in place of the
    husky** — visually coherent because the cat breed was chosen by
@@ -1888,30 +1885,34 @@ paths — the same joint loss optimization handles them all.
 ## 11. Where to start
 
 Pick up [Phase R1](#phase-r1--pez-on-the-source-image-sub-claim-1) in
-section 7. The repo doesn't currently have a PEZ implementation;
-adapting one (from Wen et al.'s public codebase, into `src/pez/`
-against the existing SD2.1 + frozen-component setup in `src/utils.py`)
-is the entry point. Once PEZ is producing discrete prompts that
-work with the existing DDIM inversion pipeline, the rest of the
-project follows naturally.
+section 7. The repo doesn't currently have a continuous-PEZ
+implementation; adapting Wen et al.'s public codebase into `src/pez/`
+(against the existing SD2.1 + frozen-component setup in
+`src/utils.py`) — and *removing* their straight-through vocabulary
+projection step — is the entry point. Once PEZ-1 is producing
+continuous embeddings that work with the existing DDIM inversion
+pipeline, the rest of the project follows naturally.
 
 The first concrete commit should:
 
 1. Create `src/pez/` with module stubs.
-2. Adapt PEZ from Wen et al.'s repo into `src/pez/search.py`. Verify
-   it runs and produces sensible discrete token IDs against a single
-   source image.
+2. Adapt PEZ from Wen et al.'s repo into `src/pez/search.py`. Strip
+   the vocabulary-projection step. Verify the soft prompt converges
+   under SDS-CFG loss and the resulting `[N, 768]` tensor produces
+   sensible reconstruction when fed to CLIP's text encoder.
 3. Wire up `src/pez/source_inversion.py` with disk caching, since each
    PEZ run is ~15-30 min and we want to iterate fast on downstream
    code.
-4. Run PEZ on one test image; pass the resulting prompt through
-   existing `src/inversion.py` to verify the integration. Compare
-   reconstruction PSNR against a BLIP-2 caption baseline.
+4. Run PEZ-1 on one test image; pass the resulting embeddings through
+   CLIP's text encoder + existing `src/inversion.py` to verify the
+   integration. Compare reconstruction PSNR against a BLIP-2 caption
+   baseline.
 
 That's the smallest viable starting point. From here, the comparison
 table for sub-claim 1 can be filled in, and Phase R2 (PEZ-2
 instruction-conditioned generation) becomes a natural next step using
-the same PEZ infrastructure with an additional loss term.
+the same PEZ infrastructure with the additional L_instr + L_anchor
+loss terms.
 
 ---
 
@@ -1925,8 +1926,9 @@ to render) and enabled outside (preserving source structure).
 
 At each denoising step, build a binary mask over the image's spatial
 grid by aggregating cross-attention to the target prompt's "edit"
-positions (the positions that differ between source and target — i.e.,
-the unmapped target indices from LCS alignment).
+positions (the positions that drifted between source and target — i.e.,
+the unmapped target indices from per-position cosine-distance
+alignment).
 
 - Inside the mask: skip P2P injection at *all* token positions for
   patches in the masked region. The target's organic cross-attention
@@ -2021,54 +2023,51 @@ same `LocalBlend` instance can be shared without double-finalization.
 
 ---
 
-## Appendix B — Semantic alignment fallback
+## Appendix B — Alignment alternatives
 
-Required only if Section 4.6's evaluation shows that LCS alignment on
-PEZ-derived token IDs produces noisy mappings. Default is LCS; this
-appendix is a fallback.
+The default alignment is **per-position cosine similarity** between
+PEZ-1 and PEZ-2 embeddings, gated by a single threshold τ (≈ 0.95).
+This works because warm-start gives source and target prompts
+identical length and per-position correspondence by construction.
 
-### Mechanism
+This appendix records two alternatives in case per-position cosine
+proves insufficient empirically:
 
-Replace LCS with bipartite matching over CLIP-embedding cosine
-similarity between source and target token contextual encodings:
+### Alternative 1 — Bipartite matching (for re-ordered drift)
 
-1. Tokenize source and target prompts. Track which positions are real
-   content tokens (skip BOS, EOS, padding).
-2. Run CLIP text encoder. Take per-token contextual encodings (the
-   77×768 unpooled output).
-3. Cosine-similarity matrix `C[i, j]` between source position `i` and
-   target position `j`, over content positions only.
-4. Solve maximum-weight bipartite matching (Hungarian algorithm,
-   `scipy.optimize.linear_sum_assignment`).
-5. Filter assignments below `similarity_threshold` (default 0.7).
-   These positions are "non-matches" and feed into LocalBlend.
+If R4 shows that PEZ-2's optimization sometimes shuffles per-position
+roles (e.g., the breed-encoding axis migrates from position 7 to
+position 9), per-position cosine fails. Replace with maximum-weight
+bipartite matching over the cosine-similarity matrix:
 
-### API
+1. Compute `C[i, j] = cos_sim(pez_1_emb[i], pez_2_emb[j])`.
+2. Solve Hungarian assignment (`scipy.optimize.linear_sum_assignment`)
+   for the best `i → j` mapping.
+3. Filter assignments below threshold τ — those are unmapped.
 
-```python
-def compute_semantic_token_mapping(
-    text_encoder,
-    tokenizer,
-    source_prompt: str,
-    target_prompt: str,
-    device: torch.device,
-    similarity_threshold: float = 0.7,
-    exclude_special_tokens: bool = True,
-) -> tuple[dict[int, int], list[int]]:
-    """Returns:
-      - mapping: {source_idx: target_idx} for matched tokens
-      - unmapped_target_indices: target positions with no source match
-        (used as LocalBlend's target_token_indices)
-    """
-```
+This handles permutations and near-synonyms but breaks the "position
+correspondence by construction" invariant. Only use if measurement
+shows it's needed.
 
-### When to use
+### Alternative 2 — Pre-CLIP embedding distance vs. post-CLIP contextual distance
 
-- LCS alignment in `attention_control/cross_attention.py:64-80` is
-  the default. PEZ-derived prompts mostly share tokens at the same
-  positions (warm-start property), so LCS works trivially in
-  practice.
-- Use semantic alignment only if PEZ-2's outputs occasionally produce
-  reordered tokens or near-synonyms (e.g., PEZ-1 has `dog` and PEZ-2
-  has `puppy` — token-ID mismatch but semantically the same).
-  Empirical question for R4.
+Per-position cosine on the *input* embeddings (`pez_*_emb`, [N, 768])
+catches drift at the optimization variable. Per-position cosine on
+the *contextual* output embeddings (post-CLIP-transformer, [N, 768])
+catches drift in how the embeddings are *contextualized*. They can
+diverge: the input embedding might drift slightly while the
+contextual encoding drifts a lot (or vice versa) because of self-
+attention interactions.
+
+Default is to align on input embeddings (cleaner, faster). If R4
+shows this misses meaningful contextual drift, switch to contextual
+or use both with separate thresholds.
+
+### When to use either alternative
+
+The default per-position-on-input-embeddings should suffice for the
+v1 pipeline because (a) warm-start keeps optimization in a small
+neighborhood, (b) L_anchor explicitly penalizes per-position drift
+in input space, and (c) PEZ-2's typical convergence touches only 1-2
+positions for typical edits. The alternatives are stress-test
+mitigations, not v1 requirements.

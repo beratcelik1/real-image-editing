@@ -264,29 +264,32 @@ def pez_search(
     seed: int,
     device: torch.device,
     initial_soft_prompt: torch.Tensor | None = None,  # warm-start
-    projection_every: int = 1,                # project to vocab every k steps
-    clip_text_encoder = None,                 # for projection step
-    tokenizer = None,                         # for vocab embedding lookup
-) -> tuple[list[int], torch.Tensor]:
-    """Core PEZ optimization loop, generic over the loss function.
+) -> torch.Tensor:
+    """Core continuous-PEZ optimization loop, generic over the loss
+    function.
 
     Returns:
-        - discrete token IDs (length prompt_length)
-        - final soft prompt (for warm-starting other PEZ runs)
+        - final soft prompt: Tensor[prompt_length, 768], the canonical
+          PEZ output (continuous CLIP-input embedding space)
 
-    Algorithm (per Wen et al. 2023, modified for arbitrary loss):
-      1. Initialize soft prompt (random or warm-start).
+    Algorithm (Wen et al. 2023's PEZ machinery without the straight-
+    through vocabulary projection — see RESEARCH_PROPOSAL.md §3.1):
+      1. Initialize soft prompt (random, or from initial_soft_prompt
+         for warm-start).
       2. For num_steps:
-         a. Project soft prompt to nearest CLIP vocab embeddings (hard
-            projection through straight-through estimator).
-         b. Compute loss = loss_fn(soft_prompt) — pluggable.
-         c. Backprop. Gradient flows through projection as identity.
-         d. AdamW step on the soft prompt.
-      3. Return final discrete token IDs and final soft prompt.
+         a. Compute loss = loss_fn(soft_prompt) — pluggable.
+         b. Backprop directly to soft_prompt. No vocabulary projection.
+         c. AdamW step on the soft prompt.
+      3. Return the final soft prompt as a continuous [N, 768] tensor.
 
     The loss_fn closure captures whatever inputs the chosen loss
     needs (target image embedding for L_clip; image latent + null-text
     + unet for L_sds).
+
+    For human-readable logging only (NOT for downstream pipeline use),
+    callers may snap the returned tensor to nearest CLIP vocabulary
+    embeddings and decode via the tokenizer. That projection is a
+    debugging aid, not the canonical artifact.
     """
 ```
 
@@ -304,12 +307,13 @@ def pez_invert_source(
     image: PIL.Image.Image,
     config: Pez1Config,
     num_rounds: int = 2,        # R from §3.1; default R=2
-) -> tuple[list[int], list[torch.Tensor]]:
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Alternating-optimization pipeline producing both PEZ-1's
-    discrete prompt AND the per-timestep null-text embeddings.
+    continuous prompt embeddings AND the per-timestep null-text.
 
     Returns:
-        - prompt_token_ids: list of N CLIP vocabulary token IDs
+        - source_embeddings: Tensor[N, 768], continuous CLIP-input
+          embeddings (the canonical PEZ-1 output)
         - null_text_per_timestep: list of T tensors, one per denoising
           timestep, each shape [1, 77, 768]
 
@@ -318,22 +322,23 @@ def pez_invert_source(
       c_0 = pez_search(loss_fn=clip_loss, ...)            # vanilla PEZ
 
       # Round 1
-      z_T, traj = ddim_inversion(image, c_0_emb)
-      N_0 = null_text_optimization(traj, c_0_emb)         # existing code
+      z_T, traj = ddim_inversion(image, c_0)
+      N_0 = null_text_optimization(traj, c_0)             # existing code
       c_1 = pez_search(loss_fn=sds_cfg_loss, null_text=N_0,
-                       initial_soft_prompt=c_0_emb)
+                       initial_soft_prompt=c_0)
 
       # Round 2 (only if num_rounds >= 2)
-      _, traj = ddim_inversion(image, c_1_emb)
-      N_1 = null_text_optimization(traj, c_1_emb)
+      _, traj = ddim_inversion(image, c_1)
+      N_1 = null_text_optimization(traj, c_1)
       c_2 = pez_search(loss_fn=sds_cfg_loss, null_text=N_1,
-                       initial_soft_prompt=c_1_emb)
+                       initial_soft_prompt=c_1)
 
-      return c_R, N_(R-1)  # the last refined prompt and matching null-text
+      return c_R, N_(R-1)  # the last refined embeddings + matching null-text
 
     Caching:
-      - Cache the final (prompt, null_text) tuple per image hash.
+      - Cache the final (embeddings, null_text) tuple per image hash.
       - Cache intermediate (c_r, N_r) so resuming after a crash is cheap.
+      - Hash the embeddings tensor (e.g., sha256 of bytes) for cache keys.
     """
 ```
 
@@ -353,19 +358,22 @@ def pez_invert_source(
 from src.pez.source_inversion import pez_invert_source
 from src.config import load_pez_1
 
-token_ids, null_text = pez_invert_source(
+source_embeddings, null_text = pez_invert_source(
     Image.open("data/cat.jpg"), load_pez_1(), num_rounds=2,
 )
+assert source_embeddings.shape == (load_pez_1().prompt_length, 768)
 
-# 1) Prompt sanity check — should be readable vocabulary tokens
+# 1) Sanity check — project to nearest vocab and decode for human readability
+#    (debug aid only; the canonical artifact is source_embeddings)
 from transformers import CLIPTokenizer
 tok = CLIPTokenizer.from_pretrained(load_pez_1().clip_model)
-print(tok.decode(token_ids))
-# Should print a sensible description, e.g.:
+projected_ids = nearest_vocab(source_embeddings, clip_text_encoder)
+print(tok.decode(projected_ids))
+# Should print a sensible (possibly cryptic) description, e.g.:
 # "a photograph of a black cat sitting on a couch"
 
 # 2) Reconstruction fidelity — should be high
-psnr = measure_inversion_fidelity(image, token_ids, null_text)
+psnr = measure_inversion_fidelity(image, source_embeddings, null_text)
 # Target: PSNR ≥ 28 dB on natural photos.
 
 # 3) Geometry-partition diagnostic (per RESEARCH_PROPOSAL.md §3.1)
@@ -407,11 +415,11 @@ loss formulation — i.e., it's also SDS-CFG-with-null-text by default.
 def pez_invert_with_instruction(
     image: PIL.Image.Image,
     instruction: str,
-    pez_1_token_ids: list[int],
+    pez_1_embeddings: torch.Tensor,           # [N, 768] from PEZ-1
     config: Pez2Config,
     null_text_embedding: torch.Tensor | None = None,
     # ^ required when config.source_loss_type == "sds"
-) -> list[int]:
+) -> torch.Tensor:
     """Run PEZ-2 with three-term joint loss, warm-started from PEZ-1.
 
     Loss (computed at each gradient step):
@@ -429,16 +437,20 @@ def pez_invert_with_instruction(
                 Stays as text-text CLIP cosine — instruction is text,
                 not image; SDS doesn't apply.
       L_anchor: ||soft_prompt - soft_prompt_init||²
-                Pulls the prompt back toward PEZ-1's tokens unless
-                instruction pressure overrides.
+                Pulls the prompt back toward PEZ-1's per-position
+                embeddings unless instruction pressure overrides.
 
     Implementation:
-      - If config.warm_start, initialize soft_prompt from
-        clip_vocab_embeddings[pez_1_token_ids].
+      - If config.warm_start, initialize
+        soft_prompt = pez_1_embeddings.clone() (identity copy of
+        PEZ-1's continuous output — no vocabulary lookup needed).
       - soft_prompt_init = soft_prompt.detach().clone()
       - Build loss_fn(soft_prompt) closure that returns
         L_source + lambda * L_instr + gamma * L_anchor.
       - Pass to pez_search().
+
+    Returns: continuous target embeddings [N, 768] (same shape as
+    pez_1_embeddings).
     """
 ```
 
@@ -451,32 +463,41 @@ def pez_invert_with_instruction(
 - `lambda_instruction`, `gamma_anchor`, `warm_start`: as before
 - `timestep_sampling`: same as PEZ-1
 
-**Caching:** keyed on `(image_hash, instruction, pez_1_token_ids,
-null_text_hash, config)`. Same pattern as PEZ-1.
+**Caching:** keyed on `(image_hash, instruction, pez_1_embeddings_hash,
+null_text_hash, config)`. Same pattern as PEZ-1; hash the embeddings
+tensor's bytes for the cache key.
 
 **Verification:**
 
 ```python
-target_ids = pez_invert_with_instruction(
+import torch.nn.functional as F
+
+target_emb = pez_invert_with_instruction(
     Image.open("data/cat.jpg"),
     "change the animal into a dog",
-    pez_1_source_ids,
+    pez_1_source_embeddings,
     load_pez_2(),
-    clip_model, tokenizer,
+    null_text_embedding=null_text,
 )
-print(tok.decode(target_ids))
-# Should print something close to PEZ-1's prompt but with "cat" → "dog":
+assert target_emb.shape == pez_1_source_embeddings.shape  # [N, 768]
+
+# Sanity check via projection (debug aid only)
+projected_ids = nearest_vocab(target_emb, clip_text_encoder)
+print(tok.decode(projected_ids))
+# Should print something close to PEZ-1's projection but with the
+# head-noun position drifted toward dog:
 # "a photo of a dog sitting...".
 
-# Token preservation: PEZ-1 vs. PEZ-2 token-ID overlap.
-shared = sum(s == t for s, t in zip(pez_1_source_ids, target_ids))
-print(f"Preservation: {shared}/{len(pez_1_source_ids)}")
-# Should be high: at least 70% of positions identical (sub-claim 2).
+# Per-position embedding stability: cosine similarity per position
+sims = F.cosine_similarity(pez_1_source_embeddings, target_emb, dim=-1)
+matched = (sims > 0.95).sum().item()
+print(f"Stability: {matched}/{len(sims)} positions above τ=0.95")
+# Should be high: at least 70% of positions stable (sub-claim 2).
 ```
 
-If preservation is < 70% even with the warm-start anchor, increase
+If stability is < 70% even with the warm-start anchor, increase
 `gamma_anchor` in `configs/pez_2.yaml` and re-run. If `gamma_anchor`
-has to go very high before preservation kicks in, that's evidence of
+has to go very high before stability kicks in, that's evidence of
 an implementation bug or unfortunate optimization landscape — log
 findings in [`docs/pez_conditional/DESIGN_CHOICES.md`](docs/pez_conditional/DESIGN_CHOICES.md).
 
@@ -549,52 +570,66 @@ Then **modify** `CrossAttentionController` to optionally accept a
 
 ---
 
-## 6. Token alignment
+## 6. Per-position alignment
 
 **File to create:** `src/splice/align.py` (and `src/splice/__init__.py`)
 
-**Note:** LCS alignment over token IDs is already in
+**Note:** previous designs used LCS over discrete token IDs. With
+continuous PEZ-1/PEZ-2, source and target prompts have identical
+length and per-position correspondence by warm-start construction —
+alignment reduces to a per-position cosine-distance check. The
+existing `compute_token_mapping` in
 [`attention_control/cross_attention.py:64-80`](attention_control/cross_attention.py#L64-L80)
-as `compute_token_mapping`. We add a thin wrapper that returns both
-the mapping and the unmapped target indices (which LocalBlend needs).
+becomes legacy and can be deleted in scope-C; this module is the
+new mechanism.
 
 ```python
+import torch
+import torch.nn.functional as F
+
 def align_pez_prompts(
-    source_token_ids: list[int],
-    target_token_ids: list[int],
-    method: Literal["lcs", "semantic"] = "lcs",
-) -> tuple[dict[int, int], list[int]]:
-    """Align two PEZ-derived prompts.
+    source_embeddings: torch.Tensor,            # [N, 768]
+    target_embeddings: torch.Tensor,            # [N, 768]
+    threshold: float = 0.95,                    # cosine similarity cutoff
+) -> tuple[list[int], list[int]]:
+    """Per-position cosine alignment between source and target embeddings.
+
+    Warm-start makes both sequences the same length with per-position
+    correspondence by construction. Position i in source corresponds
+    to position i in target.
 
     Returns:
-        - mapping: {source_pos: target_pos} for matched tokens
-        - unmapped_target_indices: target positions with no source
-          match (used as LocalBlend's target_token_indices)
+        - matched_indices: positions where cos_sim(src[i], tgt[i]) >= threshold
+          (P2P will inject source K/V to target at these positions)
+        - unmapped_target_indices: positions where cos_sim < threshold
+          (P2P leaves alone; these drive LocalBlend's target_token_indices)
 
-    method="lcs" calls existing compute_token_mapping(); fast and
-    sufficient for warm-started PEZ-2 outputs (most positions match
-    by construction).
-
-    method="semantic" is the fallback for noisy alignment cases
-    (DEFER: not in this plan; see Appendix B in the research proposal).
+    The threshold τ is the only hyperparameter. Default 0.95 follows
+    the research proposal §3.3; sweep in (0.90, 0.99) if needed
+    (see RESEARCH_PROPOSAL.md §4.7 and Open Question 5).
     """
+    assert source_embeddings.shape == target_embeddings.shape
+    sims = F.cosine_similarity(source_embeddings, target_embeddings, dim=-1)
+    matched   = [i for i, s in enumerate(sims.tolist()) if s >= threshold]
+    unmapped  = [i for i, s in enumerate(sims.tolist()) if s < threshold]
+    return matched, unmapped
 ```
 
 **Verification:** sanity check on identity prompts:
 
 ```python
-mapping, unmapped = align_pez_prompts(ids, ids)
-# mapping should be {0:0, 1:1, ..., N-1:N-1}; unmapped should be [].
+matched, unmapped = align_pez_prompts(emb, emb.clone())
+# matched should be [0, 1, ..., N-1]; unmapped should be [].
 ```
 
-And on a known substitution:
+And on a controlled drift:
 
 ```python
-src = tok.encode("a photo of a cat sitting")
-tgt = tok.encode("a photo of a dog sitting")
-mapping, unmapped = align_pez_prompts(src, tgt)
-# All positions except the cat/dog one should be in mapping;
-# the cat/dog target position should be in unmapped.
+src = pez_1_invert("a photo of a cat sitting")
+tgt = src.clone()
+tgt[6] = clip_vocab[tok.encode("dog")[0]]  # synthetic position-6 swap
+matched, unmapped = align_pez_prompts(src, tgt)
+# All positions except 6 should be matched; position 6 should be unmapped.
 ```
 
 ---
@@ -630,21 +665,26 @@ def edit_image(
 
     Pipeline (mirrors RESEARCH_PROPOSAL.md §3.7):
       1. Load image.
-      2. PEZ-1: pez_invert_source(image) → (source_token_ids, null_text)
+      2. PEZ-1: pez_invert_source(image) → (source_embeddings, null_text)
                 Cached per image; expensive (~70 min on first run).
       3. PEZ-2: pez_invert_with_instruction(
-                  image, instruction, source_token_ids, null_text,
+                  image, instruction, source_embeddings, null_text,
                   config=load_pez_2() with pez_2_overrides applied
-                ) → target_token_ids
+                ) → target_embeddings  [N, 768]
                 ↑ KNOB 1: pez_2_overrides controls (λ, γ)
-      4. Tokenize source/target prompts back to strings; encode through
-         CLIP to get encoder_hidden_states for both.
+      4. Feed each [N, 768] embedding sequence through CLIP's text
+         encoder (padded to 77 with EOS/padding) → encoder_hidden_states
+         for source and target.
       5. DDIM-invert source under source encoding → z_T (existing
          src/inversion.py).
-      6. align_pez_prompts(source_token_ids, target_token_ids)
-         → mapping, unmapped_target
+      6. matched, unmapped = align_pez_prompts(
+             source_embeddings, target_embeddings,
+             threshold=load_edit().alignment_threshold,
+         )
       7. Set up CrossAttentionController with local_blend, configured
-         by load_edit() with edit_overrides applied. Register the
+         by load_edit() with edit_overrides applied. The controller
+         consumes (matched, unmapped) instead of an LCS mapping; pass
+         unmapped to LocalBlend as target_token_indices. Register the
          controller's processor on the U-Net's cross-attention layers.
                 ↑ KNOB 2: edit_overrides controls cross_replace_steps
       8. Run editing denoising loop with [source, target] batch
@@ -696,9 +736,9 @@ inner loop:
 
 ```python
 for k1 in KNOB_1_SETTINGS:
-    target_token_ids = pez_invert_with_instruction(... k1 ...)  # ~10 min
+    target_emb = pez_invert_with_instruction(... k1 ...)        # ~10 min
     for k2 in KNOB_2_SETTINGS:
-        edit = run_editing(... target_token_ids ..., k2 ...)    # ~2 min
+        edit = run_editing(... target_emb ..., k2 ...)          # ~2 min
         save(edit, k1, k2)
 ```
 
@@ -719,12 +759,14 @@ Output should be saved to `outputs/cat_edited.png` and visually:
 
 If structural preservation fails (totally different pose/composition),
 the issue is likely in the controller wiring or LocalBlend setup —
-check that `register_combined_control()` ran and that
-`mapping`/`unmapped_target` look sensible.
+check that the cross-attention processor was registered on the U-Net,
+and that `matched`/`unmapped` from `align_pez_prompts` look sensible
+for the (source, target) embedding pair.
 
 If the dog doesn't render (or stays cat-like), the issue is likely
-in PEZ-2 — check that `target_token_ids` actually contain "dog" or
-similar by decoding them to a string.
+in PEZ-2 — project `target_embeddings` to nearest vocab and decode
+to verify a dog-direction token appears (or run with a higher
+`lambda_instruction` to push harder).
 
 ---
 
@@ -742,17 +784,19 @@ def test_config_loading():
     assert load_local_blend().threshold > 0
     assert load_edit().sd_model
 
-def test_pez1_returns_valid_token_ids():
-    """PEZ-1 on a small test image returns the expected number of
-    token IDs, all within CLIP's vocab range."""
+def test_pez1_returns_valid_embeddings():
+    """PEZ-1 on a small test image returns a [N, 768] tensor with
+    the expected shape, finite values, and reasonable per-position
+    norms."""
 
 def test_pez2_warm_start_preserves_majority():
-    """PEZ-2 with high gamma_anchor preserves >50% of source tokens
-    even with a strong instruction (sanity check on warm-start)."""
+    """PEZ-2 with high gamma_anchor preserves >50% of positions
+    (cosine_similarity above τ=0.95) vs. PEZ-1 even with a strong
+    instruction (sanity check on warm-start)."""
 
 def test_align_identity():
-    """Aligning identical prompts gives identity mapping, empty
-    unmapped."""
+    """Aligning identical embeddings gives all positions matched and
+    no unmapped."""
 
 def test_local_blend_step_is_idempotent():
     """Calling LocalBlend.step() twice in the same step doesn't
@@ -775,15 +819,17 @@ These should all pass before considering the basic pipeline complete.
 - Verify CLIP model matches SD's CLIP variant exactly
 - Log findings in [`docs/pez_conditional/DESIGN_CHOICES.md`](docs/pez_conditional/DESIGN_CHOICES.md)
 
-**PEZ-2 token preservation rate too low:**
+**PEZ-2 per-position embedding stability too low:**
 - Increase `gamma_anchor` (stronger warm-start pull)
 - Decrease `lambda_instruction` (weaker instruction pull)
-- Verify the warm-start initialization is actually being used (log the
-  initial soft prompt vs. PEZ-1's vocab embeddings)
+- Verify the warm-start initialization is actually being used (log
+  ‖soft_prompt - pez_1_embeddings‖ at step 0; should be ≈ 0)
 
 **P2P edit produces no change vs. source:**
 - Verify the [source, target] batch is correctly stacked
-- Verify `mapping` has reasonable matched positions
+- Verify `align_pez_prompts` returns reasonable `matched`/`unmapped`
+  (lower the threshold τ if everything is matched; raise if everything
+  is unmapped)
 - Verify the cross-attention controller is actually registered on the
   U-Net's cross-attention layers
 
