@@ -59,11 +59,16 @@ def test_no_torch_config_loading():
     ed = load_edit()
     assert ed.sd_model
     assert 0 < ed.cross_attention.cross_replace_steps <= 1
+    # PnP-light self-attention map swap (Tumanyan et al. 2023). 0
+    # disables; the v1 default tracks Hertz et al.'s word-swap
+    # recommendation (~0.4-0.6).
+    assert 0.0 <= ed.self_attention.self_replace_steps <= 1.0
     assert ed.alignment_method == "cosine_threshold"
     assert 0.0 < ed.alignment_threshold <= 1.0
     assert ed.mode == "replace", (
         "v1 default and only-supported mode is 'replace'. "
-        "ADD and EXPLICIT_REPLACE are future modes (RESEARCH_PROPOSAL.md §3.0)."
+        "ADD, EXPLICIT_REPLACE, STYLE are future modes "
+        "(RESEARCH_PROPOSAL.md §3.0)."
     )
 
 

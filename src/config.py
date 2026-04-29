@@ -133,6 +133,14 @@ class CrossAttentionConfig:
 
 
 @dataclass
+class SelfAttentionConfig:
+    """Inner self-attention sub-config of EditConfig (PnP-style)."""
+
+    self_replace_steps: float
+    # layer_indices is shared with cross_attention (filters both).
+
+
+@dataclass
 class EditConfig:
     """End-to-end editing pipeline config (configs/edit.yaml).
 
@@ -143,10 +151,13 @@ class EditConfig:
     sd_model: str
     ddim: DDIMConfig
     cross_attention: CrossAttentionConfig
+    self_attention: SelfAttentionConfig   # PnP-style self-attention injection
+                                          # (Tumanyan et al. 2023). 0 disables.
     alignment_method: str        # "cosine_threshold" only in v1
     alignment_threshold: float   # τ in proposal §3.3 (cosine cutoff)
     mode: str                    # "replace" only in v1
-                                 # "add" / "explicit_replace" → NotImplementedError
+                                 # "add" / "explicit_replace" / "style"
+                                 # → NotImplementedError
                                  # See RESEARCH_PROPOSAL.md §3.0.
     device: str
     dtype: str
@@ -185,4 +196,5 @@ def load_edit(path: Path | str = "edit.yaml") -> EditConfig:
     raw = _load_yaml(path)
     raw["ddim"] = DDIMConfig(**raw["ddim"])
     raw["cross_attention"] = CrossAttentionConfig(**raw["cross_attention"])
+    raw["self_attention"] = SelfAttentionConfig(**raw["self_attention"])
     return EditConfig(**raw)

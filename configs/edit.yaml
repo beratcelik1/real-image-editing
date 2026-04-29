@@ -36,6 +36,21 @@ cross_attention:
   # ablation in the notebook (KNOB_2_GRID).
   cross_replace_steps: 0.4
   layer_indices: null         # null = all cross-attention layers
+                              # (also filters self-attention if enabled)
+
+# Plug-and-Play (Tumanyan et al. 2023) self-attention injection.
+# Source's self-attention map is copied to target for the first
+# `self_replace_steps` fraction of denoising. Self-attention determines
+# spatial structure / texture; copying source's preserves source
+# structure even as target's cross-attention drives content changes.
+#
+# Hertz et al. 2022 (P2P) recommend ~0.4-0.6 for word-swap edits.
+# Tumanyan et al. (PnP) typically use higher values.
+# Set to 0.0 to disable entirely (cross-attention-only P2P, the
+# original v1 behavior). Reference implementation:
+# external/plug-and-play/.
+self_attention:
+  self_replace_steps: 0.4
 
 # Edit mode (RESEARCH_PROPOSAL.md §3.0). Four rule-based modes; v1
 # implements only REPLACE. ADD, EXPLICIT_REPLACE, and STYLE raise

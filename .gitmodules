@@ -4,3 +4,6 @@
 [submodule "external/prompt-to-prompt"]
 	path = external/prompt-to-prompt
 	url = https://github.com/google/prompt-to-prompt.git
+[submodule "external/plug-and-play"]
+	path = external/plug-and-play
+	url = https://github.com/MichalGeyer/plug-and-play.git

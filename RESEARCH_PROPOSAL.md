@@ -531,14 +531,14 @@ editing-time configuration.
   too much, anchor too tight) or over-edit on content (everything
   drifts, table-becomes-cat-style contamination). The mode separation
   encodes which behavior the user wants.
-- **Why we may eventually want self-attention manipulation here.**
-  Style is conventionally handled in attention literature via
-  self-attention or AdaIN-style feature swapping. v1 is P2P-only
-  (cross-attention manipulation only — see proposal scope). STYLE
-  mode in R7 will start with cross-attention only (just lowered
-  `cross_replace_steps`). If empirically that's insufficient, R7
-  may re-introduce self-attention injection in PnP-style for STYLE
-  mode specifically.
+- **Self-attention manipulation already partially in place.** v1
+  implements PnP-light: self-attention *map* swap via
+  `self_attention.self_replace_steps` in `edit.yaml`, default 0.4.
+  This applies to all modes (REPLACE included) and improves
+  structure preservation alongside cross-attention swap. STYLE
+  mode in R7 may need the *residual feature injection* half of
+  full PnP additionally (more invasive — hooks into UNet blocks,
+  not just attention processors). See §3.8 deviation notes.
 
 ### 3.1 PEZ on the source image (sub-claim 1)
 
@@ -1341,16 +1341,31 @@ DreamFusion). Listed for honest scoping and to pre-empt reviewer
   when it lands.
 - **`layer_indices` (which cross-attention layers): ✓ all (None
   default).** Matches Hertz's recommendation.
-- **Self-attention injection (PnP, Tumanyan et al. 2023): omitted
-  in v1.** The proposal scoped this out (see Section 6 reuse map).
-  For substitution edits this is a tolerable compromise. **For
-  STYLE mode (R7), this is a real loss** — style is conventionally
-  handled in attention literature via self-attention or AdaIN-style
-  feature swapping. R7 will start cross-attention-only with lowered
-  `cross_replace_steps`; if that's insufficient, R7 will re-introduce
-  PnP self-attention specifically for STYLE mode. The architecture
-  is designed to accommodate this re-introduction without disturbing
-  the REPLACE / ADD / EXPLICIT_REPLACE machinery.
+- **Self-attention injection (PnP, Tumanyan et al. 2023): partially
+  implemented as "PnP-light" in v1.** We implement self-attention
+  *map* swap — source's self-attention probabilities are copied to
+  target for the first `self_replace_steps` fraction of denoising
+  (configurable in `edit.yaml`, `self_attention.self_replace_steps`,
+  default 0.4 per Hertz et al.'s word-swap recommendation). This is
+  the cheaper half of full PnP; it benefits all modes (REPLACE
+  included) by improving structure preservation alongside cross-
+  attention swap.
+  - **What v1 does NOT do:** the full Tumanyan PnP additionally
+    injects residual block features at specific U-Net layers, which
+    requires more invasive hooks (not just attention processor
+    replacement). Skipped because (a) it's substantially more code
+    against the diffusers UNet's internals and (b) the lighter
+    self-attention map swap delivers most of the benefit for
+    REPLACE-style edits.
+  - **For STYLE mode (R7):** if self-attention-map-swap proves
+    insufficient for global aesthetic shifts, R7 will add the
+    residual feature injection too. The architecture accommodates
+    this — `CrossAttentionController` already dispatches by
+    `is_cross`; adding hooks for residual block features is the
+    additional R7 work.
+  - **Reference implementation:** `external/plug-and-play/`
+    submodule (Tumanyan et al.'s original code, reads SD's vanilla
+    UNet not diffusers).
 
 **From Mokady et al. 2022 (Null-text Inversion):**
 - ✓ Followed: per-timestep null-text optimized for faithful
@@ -2031,27 +2046,27 @@ move toward style-axis" rather than "few positions move."
 - No changes to PEZ-1 or PEZ-2's algorithm — same machinery, just
   different operating point.
 
-**Open question — likely answered by re-introducing PnP.** Cross-
-attention manipulation alone is widely understood to be insufficient
-for stylistic edits — style is conventionally handled via self-
-attention or AdaIN-style feature swapping. The original P2P paper
-itself noted this limitation, and Plug-and-Play Diffusion (Tumanyan
-et al. 2023) was developed specifically to address it via self-
-attention injection. v1 is P2P-only (cross-attention only) by
-project scope, but **R7 should plan to re-introduce PnP self-
-attention injection from the start** rather than try cross-attention-
-only first. The empirical evidence from prior work strongly suggests
-cross-attention alone is the wrong tool for global aesthetic shifts;
-attempting it first would just re-derive the known limitation.
+**Status of self-attention manipulation.** The lighter half of PnP —
+self-attention map swap — was added in v1 (`self_replace_steps`
+config in `edit.yaml`; benefits all modes including REPLACE for
+better structure preservation). What R7 still needs is the *residual
+block feature injection* half of full PnP, which is more invasive
+(hooks into diffusers UNet's down/mid/up blocks at specific layers,
+beyond the attention-processor replacement that the v1 code uses).
 
-The re-introduction is contained to STYLE mode — REPLACE / ADD /
-EXPLICIT_REPLACE all stay cross-attention-only and don't change.
-The architecture is designed for this: the CrossAttentionController
-already has `is_cross` switching, and adding a parallel
-SelfAttentionController for STYLE is a natural extension.
+**Open question — does residual feature injection materially help
+STYLE mode beyond what self-attention-map swap already provides?**
+If yes, R7 adds it. If empirically the self-attention-map swap is
+already sufficient for stylistic edits at higher
+`self_replace_steps` values, R7's main work is just (λ, γ,
+self_replace_steps) preset tuning + the `mode == "style"` validation
+guard relaxation.
 
-**Estimated time:** 2-4 weeks on top of R4 (PnP self-attention
-implementation + integration with the editing loop's mode dispatch).
+**Estimated time:**
+- If only mode-dispatch + preset tuning needed: 1 week.
+- If residual feature injection is also needed: 3-4 weeks (need to
+  hook diffusers UNet's block forwards, more invasive than the
+  current attention-processor approach).
 
 These phases (R5, R6, R7) are non-load-bearing for the project's main
 contribution (the two-PEZ + P2P architecture), but they materially

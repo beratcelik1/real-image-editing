@@ -501,6 +501,7 @@ def run_p2p_edit(
     cross_ctrl = CrossAttentionController(
         num_steps=edit_config.ddim.num_steps,
         cross_replace_steps=edit_config.cross_attention.cross_replace_steps,
+        self_replace_steps=edit_config.self_attention.self_replace_steps,
         token_mapping=mapping,
         layer_indices=layer_indices,
         local_blend=local_blend,

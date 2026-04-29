@@ -102,6 +102,7 @@ class CrossAttentionController:
         self,
         num_steps: int,
         cross_replace_steps: float = 0.8,
+        self_replace_steps: float = 0.0,
         token_mapping: dict[int, int] | None = None,
         reweight_factors: dict[int, float] | None = None,
         reweight_steps: float = 1.0,
@@ -119,9 +120,33 @@ class CrossAttentionController:
             in ``_word_swap``. When ``None`` (default), the controller
             behaves identically to the original P2P implementation.
             See ``attention_control/local_blend.py``.
+        self_replace_steps : float
+            Fraction of denoising steps during which the source's
+            self-attention map is copied onto the target — the
+            "Plug-and-Play" (Tumanyan et al. 2023) self-attention
+            injection mechanism. Self-attention determines spatial
+            structure / texture / identity (vs cross-attention which
+            determines what content goes where). Copying source's
+            self-attention to target preserves source structure even
+            as target's cross-attention drives content changes.
+
+            0.0 (default) disables self-attention injection entirely
+            — backward-compatible with the cross-attention-only P2P
+            setup. Hertz et al. 2022's word-swap recommendation is
+            ~0.4-0.6; Tumanyan PnP uses higher values for stronger
+            structure preservation. ``layer_indices`` filters which
+            layers are edited (applies to both cross- and self-
+            attention).
+
+            Reference: external/plug-and-play/ for the original
+            Tumanyan implementation. We implement the lighter
+            self-attention map swap here; full PnP also injects
+            residual block features which is more invasive (not in
+            v1 — see RESEARCH_PROPOSAL.md §3.8).
         """
         self.num_steps = num_steps
         self.cross_replace_steps = cross_replace_steps
+        self.self_replace_steps = self_replace_steps
         self.token_mapping = token_mapping
         self.reweight_factors = reweight_factors
         self.reweight_steps = reweight_steps
@@ -196,6 +221,20 @@ class CrossAttentionController:
         Tensor — the (possibly modified) attention weights.
         """
         if not is_cross:
+            # Self-attention path: optional PnP-style self-attention
+            # map injection. Source's self-attention probabilities are
+            # copied to target at all spatial positions for the first
+            # `self_replace_steps` fraction of denoising. Layer filter
+            # applies (same set as cross-attention editing).
+            if (
+                self.self_replace_steps > 0.0
+                and self._cur_step < self.num_steps * self.self_replace_steps
+            ):
+                if (
+                    self.layer_indices is None
+                    or layer_idx in self.layer_indices
+                ):
+                    attn_weights = self._self_attention_swap(attn_weights)
             return attn_weights
 
         # Store (always, regardless of layer filter).
@@ -280,6 +319,32 @@ class CrossAttentionController:
                 attn[:, :, :, tok_idx] *= scale
         attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-8)
         return attn
+
+    def _self_attention_swap(self, attn: torch.Tensor) -> torch.Tensor:
+        """Replace target's self-attention map with source's (PnP-style).
+
+        Self-attention shape is ``[batch, heads, spatial, spatial]`` —
+        each spatial query attends to other spatial keys; there is no
+        "token" axis to map (unlike cross-attention's ``[B, H, S, T]``).
+        So the swap is a wholesale tensor copy: target's self-attention
+        becomes source's at all positions, for the current denoising
+        step.
+
+        Batch layout: ``[source..., target...]`` — first half source,
+        second half target. Works for batch=2 (no CFG) and batch=4
+        (with CFG).
+
+        Reference: external/plug-and-play/ (Tumanyan et al. 2023).
+        Their full PnP also injects residual block features at specific
+        layers; this is the lighter "self-attention map swap only"
+        variant. See proposal §3.8.
+        """
+        half = attn.shape[0] // 2
+        if half == 0:
+            return attn
+        source = attn[:half]
+        target = source.clone()  # target inherits source's full self-attention
+        return torch.cat([source, target], dim=0)
 
 
 # ---------------------------------------------------------------------------
