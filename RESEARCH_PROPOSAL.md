@@ -1344,36 +1344,64 @@ Knob-2 setting only):
   preservation but low concept fidelity; loud → high concept fidelity
   but degraded structure preservation. Moderate sits at the elbow.
 
-### 4.5 Knob 1 × Knob 2 interaction grid
+### 4.5 Full (λ, γ, cross_replace_steps) sweep
 
-The two control knobs identified above operate at different stages of
-the pipeline and are nominally independent, but interact in their
-effect on the final edit. This evaluation maps the joint operating
-space.
+Knob 1 is two-dimensional in its own right (`λ_instruction` and
+`γ_anchor` are independent — see §3.2's discussion of why they're
+not redundant). Combined with Knob 2's `cross_replace_steps`, the
+joint operating space is **3D: λ × γ × cross_replace_steps**.
 
-**Why this is cheap.** Knob 1 lives at PEZ-2 optimization time
-(needs to re-run PEZ-2: ~10 min per setting). Knob 2 lives at editing
-time (just re-run the denoising loop: ~2 min per setting). For each
-PEZ-2 output, all Knob-2 settings can be evaluated for ~2 min × |Knob
-2| extra time — no re-optimization needed.
+The project's contribution is on the Knob-1 side — the 2D (λ, γ)
+plane is where we expect to characterize PEZ-2's behavior. Knob 2 is
+inherited P2P machinery; we sweep it for completeness but the
+visualization treats it as a secondary axis (replicated panels rather
+than equal-status axes).
+
+**Why we run the full grid despite Knob 2 not being a contribution
+axis.** Knob 2's per-cell cost is ~2 min editing on top of an already-
+computed PEZ-2 output, so adding |Knob 2| panels is cheap relative to
+the |Knob 1| PEZ-2 budget. Generating all 36 cells lets us
+demonstrate that the (λ, γ) story holds across reasonable Knob-2
+choices (rather than being an artifact of one cross_replace_steps
+setting), without committing to Knob 2 as a contribution axis.
 
 **Sweep design.**
 
 For each of 5 representative (image, instruction) pairs in the test
-set, evaluate the 3 × 3 = 9 setting grid:
+set, evaluate the **4 × 3 × 3 = 36 setting grid**:
 
-```
-                     Knob 2 (edit aggressiveness)
-                     Subtle    Moderate    Loud
-Knob 1     Conservative   ⬜       ⬜         ⬜
-(divergence)  Moderate    ⬜       ⬜         ⬜
-              Aggressive  ⬜       ⬜         ⬜
-```
+- `λ_instruction ∈ {0.5, 1.0, 2.0, 5.0}` (Knob 1.a, primary axis)
+- `γ_anchor ∈ {1.0, 0.1, 0.01}` (Knob 1.b, primary axis)
+- `cross_replace_steps ∈ {0.8, 0.5, 0.3}` (Knob 2, secondary axis)
+
+**Visualization is (λ, γ)-centric.** Heatmaps and image grids use λ
+and γ as their two axes; cross_replace_steps appears as a third
+dimension via:
+- **Image grid:** three (λ × γ) panels stacked or shown side-by-side,
+  one per cross_replace_steps value. Plus a GIF cycling
+  cross_replace_steps as the animation frame, with the **BLIP-baseline
+  edit included as a sidecar cell** in each frame so the reader sees
+  method-vs-baseline at every cross_replace_steps step.
+- **Heatmaps:** the per-position embedding-stability and quality-
+  metric heatmaps lay out (λ, γ) as the two visible axes; if a
+  heatmap depends on cross_replace_steps it gets the same
+  "three-panels-or-GIF" treatment.
+- **Per-(λ, γ) strip comparison:** for each operating point a
+  cross_replace_steps strip (1×3 row of method edits) is paired
+  with the BLIP-baseline strip at the same cross_replace_steps
+  values, producing a 13-row mega-figure (12 method strips + 1
+  baseline strip × 3 cross_replace_steps cols). This is the
+  reader-facing "is this (λ, γ) operating point better than the
+  baseline" scan view.
 
 **Cost per (image, instruction) pair:**
-- 3 PEZ-2 runs × ~10 min = ~30 min
-- 9 edits × ~2 min = ~18 min
-- Total: ~50 min per pair
+- 12 PEZ-2 runs × ~10 min = ~2 h
+- 36 edits × ~2 min = ~1.2 h
+- Total: ~3.2 h per pair
+
+For 5 representative pairs: ~16 h of GPU time. Cost-aware ordering
+(outer loop over (λ, γ), inner over cross_replace_steps) keeps PEZ-2
+amortized — each PEZ-2 output is reused across all 3 Knob-2 values.
 
 For 5 representative pairs: ~4 hours of GPU time. Scales linearly
 with the size of the representative set.
