@@ -686,6 +686,20 @@ implementations preserves the clarity of the proposal's narrative
 without compromising correctness — both routes implement the same
 mathematical effect at their respective stages.
 
+**PEZ-2's symmetric fix.** The anti-anchoring pathology described
+above (AdamW's `weight_decay` decaying toward origin) is *not* unique
+to PEZ-1 — PEZ-2 has the same issue any time `weight_decay > 0`,
+and it's worse in PEZ-2 because at step 0 (when `soft_prompt = init`)
+the L_anchor gradient is zero but `weight_decay` is *immediately*
+pulling away from `init` toward origin. A nonzero AdamW `weight_decay`
+would silently drift the soft prompt toward origin in the early
+steps and contaminate the (λ, γ) ablation grid (§4.2). The fix is
+the symmetric one: **PEZ-2 hardcodes AdamW's `weight_decay` to 0.0**
+so `L_anchor` is the *sole* regularizer. This is not a config knob —
+exposing it would invite users to retune it, reintroducing the
+pathology. The decision is captured in `instruction_conditioned.py`
+inline.
+
 **Why this enforces the geometry partition (priority 1).** Each step's
 natural bias aligns to push geometry into null-text and semantics into
 the prompt:

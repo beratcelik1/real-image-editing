@@ -191,7 +191,18 @@ def pez_invert_with_instruction(
         prompt_length=prompt_length,
         num_steps=config.num_steps,
         learning_rate=config.learning_rate,
-        weight_decay=0.1,                  # standard
+        # PEZ-2's anchor is the L_anchor term in the joint loss above
+        # (||soft_prompt - soft_prompt_init||² with γ = gamma_anchor).
+        # AdamW.weight_decay is hardcoded to 0.0 — NOT a config knob —
+        # because any positive value would silently pull soft_prompt
+        # toward CLIP-space-origin and conflict with L_anchor pulling
+        # toward soft_prompt_init. That contamination would distort the
+        # (λ, γ) ablation grid in §4.2 of the research proposal.
+        # See RESEARCH_PROPOSAL.md §3.1 "Residual parameterization for
+        # SDS rounds" for the symmetric PEZ-1 fix and the rationale for
+        # keeping these as two distinct mechanisms (residual parameter-
+        # ization vs explicit L_anchor loss term) at the two stages.
+        weight_decay=0.0,
         seed=config.seed,
         device=device,
         initial_soft_prompt=soft_prompt_init,
