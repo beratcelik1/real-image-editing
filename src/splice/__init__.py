@@ -1,9 +1,10 @@
 """Prompt-side glue: token-alignment helpers and (later) refined-embedding
 encoding.
 
-The `align_pez_prompts` function wraps `attention_control.cross_attention.
-compute_token_mapping` and additionally returns the unmapped target
-positions, which `LocalBlend` uses as its `target_token_indices`.
+`align_pez_prompts` does per-position cosine alignment between two
+continuous PEZ embeddings; positions above the cosine threshold are
+matched, the rest are unmapped (the latter feeds `LocalBlend`'s
+`target_token_indices` in ADD mode).
 """
 
 from src.splice.align import align_pez_prompts

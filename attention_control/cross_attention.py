@@ -9,13 +9,16 @@ Usage
 -----
     from attention_control.cross_attention import (
         CrossAttentionController,
-        compute_token_mapping_from_text,
         register_attention_control,
         unregister_attention_control,
     )
+    from src.splice.align import align_pez_prompts
 
-    # Build token mapping between source and target prompts
-    mapping = compute_token_mapping_from_text(tokenizer, src_prompt, tgt_prompt)
+    # Build per-position token mapping between continuous PEZ embeddings.
+    # Returns matched + unmapped position indices over the [N, D] sequence
+    # (BOS/EOS offsets handled at the call site).
+    matched, unmapped = align_pez_prompts(src_emb, tgt_emb, threshold=0.95)
+    mapping = {i + 1: i + 1 for i in matched}  # +1 for BOS
 
     # Create controller
     controller = CrossAttentionController(
@@ -50,49 +53,8 @@ Re-weighting has no batch layout requirement and works with any batch size.
 
 from __future__ import annotations
 
-from difflib import SequenceMatcher
-
 import torch
 from diffusers.models.attention_processor import Attention
-
-
-# ---------------------------------------------------------------------------
-# Token alignment utilities
-# ---------------------------------------------------------------------------
-
-
-def compute_token_mapping(
-    source_ids: list[int],
-    target_ids: list[int],
-) -> dict[int, int]:
-    """Align source and target token sequences via longest common subsequence.
-
-    Returns ``{source_idx: target_idx}`` for every token that appears in both
-    sequences at a matched position.  Unmatched tokens (insertions, deletions,
-    substitutions) are omitted — their attention maps will *not* be copied from
-    the source during word-swap injection.
-    """
-    matcher = SequenceMatcher(None, source_ids, target_ids, autojunk=False)
-    mapping: dict[int, int] = {}
-    for block in matcher.get_matching_blocks():
-        for i in range(block.size):
-            mapping[block.a + i] = block.b + i
-    return mapping
-
-
-def compute_token_mapping_from_text(
-    tokenizer,
-    source_prompt: str,
-    target_prompt: str,
-) -> dict[int, int]:
-    """Tokenize two prompts and compute their token alignment.
-
-    Convenience wrapper around :func:`compute_token_mapping` for text
-    modalities that use a HuggingFace-style tokenizer.
-    """
-    source_ids = tokenizer.encode(source_prompt)
-    target_ids = tokenizer.encode(target_prompt)
-    return compute_token_mapping(source_ids, target_ids)
 
 
 # ---------------------------------------------------------------------------

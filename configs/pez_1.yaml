@@ -27,6 +27,15 @@ timestep_sampling: uniform    # "uniform" or "importance" — focus on
                               # mid-timesteps where SDS signal is
                               # strongest. Implement uniform first.
 
+# Number of DDIM denoising steps used in SDS rounds for both
+# ddim_inversion and null_text_optimization. MUST match
+# configs/edit.yaml's ddim.num_steps so the per-timestep null-text
+# produced here has the same length the editing loop consumes —
+# otherwise run_p2p_edit warns and falls back to default uncond,
+# silently losing Mokady-style null-text inversion. Standard 50 is
+# the v1 default everywhere.
+ddim_num_steps: 50
+
 # ─── Prompt structure ────────────────────────────────────────────
 prompt_length: 75             # N positions in [N, 768]. The HARD MAX
                               # is 75 (CLIP context is 77; reserve 2

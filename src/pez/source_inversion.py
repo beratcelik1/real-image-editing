@@ -264,7 +264,11 @@ def pez_invert_source(
 
 
 def _str_to_dtype(s: str) -> torch.dtype:
-    return {"float16": torch.float16, "float32": torch.float32}[s]
+    return {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }[s]
 
 
 def _load_sd_components_dict(config: Pez1Config) -> dict:
@@ -340,9 +344,15 @@ def _sds_loss_with_t_sampled_null_text(
 
     if timestep_sampling == "uniform":
         t_idx = torch.randint(0, T, (1,), device=device, dtype=torch.long)
-    else:  # "importance" — bias toward mid-timesteps
-        u = torch.rand(1, device=device)
-        t_idx = ((1 - torch.sqrt(1 - u)) * T).long().clamp_(0, T - 1)
+    else:  # "importance" — triangular bias toward mid-timesteps.
+        # Sum of two Uniform[0,1] draws is triangular on [0,2] with mode 1;
+        # halving puts the mode at 0.5 and the support back to [0,1].
+        # SDS gradient signal is strongest at mid-timesteps (DreamFusion);
+        # the prior `1 - sqrt(1-u)` formula peaked at u=0 instead, biasing
+        # toward the noisiest end (timesteps[0] = highest training-t).
+        u1 = torch.rand(1, device=device)
+        u2 = torch.rand(1, device=device)
+        t_idx = (((u1 + u2) / 2) * T).long().clamp_(0, T - 1)
 
     null_text_for_t = null_text_per_timestep[t_idx.item()]      # [1, 77, D]
     t = scheduler_timesteps[t_idx.item()].view(1).to(device=device, dtype=torch.long)

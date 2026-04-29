@@ -35,11 +35,15 @@ def _hash_pez2(
     image: Image.Image,
     instruction: str,
     pez_1_embeddings: torch.Tensor,
+    null_text_per_timestep: list[torch.Tensor],
     config: Pez2Config,
 ) -> str:
-    """Cache key for PEZ-2: every config field that affects the result.
+    """Cache key for PEZ-2: every input that affects the result.
 
-    Bug #4 fix: previously omitted learning_rate and timestep_sampling.
+    L_source uses null_text_per_timestep, so changes to the null-text
+    that don't propagate through pez_1_embeddings (e.g. tweaking PEZ-1's
+    null-text-optim opt_steps/lr while leaving the embeddings unchanged)
+    must invalidate the cache. Hashes the concatenated tensor bytes.
     """
     h = hashlib.sha256()
     h.update(image.tobytes())
@@ -47,6 +51,11 @@ def _hash_pez2(
     h.update(image.size[1].to_bytes(4, "little"))
     h.update(instruction.encode("utf-8"))
     h.update(pez_1_embeddings.detach().cpu().contiguous().numpy().tobytes())
+    null_text_stacked = torch.stack(
+        [nt.detach().cpu().contiguous() for nt in null_text_per_timestep],
+        dim=0,
+    )
+    h.update(null_text_stacked.numpy().tobytes())
     cfg_str = (
         f"{config.source_loss_type}|cfg={config.cfg_scale}|"
         f"ts_sampling={config.timestep_sampling}|"
@@ -94,7 +103,9 @@ def pez_invert_with_instruction(
         CLIP's text encoder for downstream P2P editing.
     """
     # Cache check
-    image_hash = _hash_pez2(image, instruction, pez_1_embeddings, config)
+    image_hash = _hash_pez2(
+        image, instruction, pez_1_embeddings, null_text_per_timestep, config,
+    )
     cache_file = Path(config.cache_dir) / f"{image_hash}.pt"
     if config.use_cache and cache_file.exists():
         cached = torch.load(cache_file, map_location="cpu")
@@ -158,8 +169,12 @@ def pez_invert_with_instruction(
         if config.timestep_sampling == "uniform":
             t_idx = torch.randint(0, T, (1,), device=device, dtype=torch.long)
         else:
-            u = torch.rand(1, device=device)
-            t_idx = ((1 - torch.sqrt(1 - u)) * T).long().clamp_(0, T - 1)
+            # Triangular bias toward mid-timesteps: sum of two Uniform[0,1]
+            # is triangular on [0,2] with mode 1; halving lands the mode at
+            # 0.5 → t_idx near T/2 where SDS gradient signal is strongest.
+            u1 = torch.rand(1, device=device)
+            u2 = torch.rand(1, device=device)
+            t_idx = (((u1 + u2) / 2) * T).long().clamp_(0, T - 1)
         null_text_for_t = null_text_stacked[t_idx.item()]
         t = scheduler_timesteps[t_idx.item()].view(1).to(device=device, dtype=torch.long)
 
@@ -241,7 +256,11 @@ def pez_invert_with_instruction(
 
 
 def _str_to_dtype(s: str) -> torch.dtype:
-    return {"float16": torch.float16, "float32": torch.float32}[s]
+    return {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }[s]
 
 
 def _encode_text_pooled(

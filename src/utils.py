@@ -80,6 +80,14 @@ def load_sd_components(
     )
     scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
+    # The optimization variable is the soft prompt; SD's component
+    # weights are never updated. Without requires_grad_=False the
+    # autograd graph for every PEZ-1/PEZ-2 SDS step keeps activations
+    # alive for ~all of text_encoder/vae/unet — wasted memory.
+    text_encoder.requires_grad_(False)
+    vae.requires_grad_(False)
+    unet.requires_grad_(False)
+
     return unet, vae, text_encoder, tokenizer, scheduler
 
 

@@ -34,6 +34,12 @@ class Pez1Config:
     cfg_scale: float
     timestep_sampling: str  # "uniform" or "importance"
 
+    # DDIM/null-text num_steps used in SDS rounds. Must match
+    # EditConfig.ddim.num_steps so editing-time null-text-per-timestep
+    # has the same length the editing loop consumes (otherwise
+    # run_p2p_edit silently falls back to default uncond — see Bug #3).
+    ddim_num_steps: int
+
     # Prompt structure
     prompt_length: int
 

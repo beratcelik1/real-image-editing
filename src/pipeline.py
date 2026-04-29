@@ -621,7 +621,11 @@ def _load_sd_components_dict(edit_config: EditConfig) -> dict:
 
 
 def _str_to_dtype(s: str) -> torch.dtype:
-    return {"float16": torch.float16, "float32": torch.float32}[s]
+    return {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }[s]
 
 
 if __name__ == "__main__":
