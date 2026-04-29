@@ -4,6 +4,54 @@ from __future__ import annotations
 
 from pathlib import Path
 
+
+def _patch_hf_chat_template_404() -> None:
+    """Workaround for transformers >= ~4.45 mis-handling 404 on chat-template
+    lookup for non-LLM tokenizers (CLIPTokenizer in particular).
+
+    transformers calls ``list_repo_tree(repo, "additional_chat_templates")``
+    inside ``CLIPTokenizer.from_pretrained``. CLIP doesn't have chat
+    templates, so HF returns 404. transformers catches
+    ``RepositoryNotFoundError`` internally — but with newer
+    huggingface_hub the exception path / class doesn't always match
+    the catch, so it escapes to the user as a fatal error even though
+    the model is fine.
+
+    Patch ``huggingface_hub.utils._pagination.paginate`` to silently
+    return empty for any URL containing ``additional_chat_templates``,
+    making the chat-template lookup return [] and letting the load
+    proceed. Idempotent; safe to call multiple times.
+    """
+    try:
+        from huggingface_hub.utils import _pagination
+    except ImportError:
+        return  # very old huggingface_hub; nothing to patch
+
+    if getattr(_pagination, "_chat_template_404_patched", False):
+        return  # already patched
+
+    _orig_paginate = _pagination.paginate
+
+    def _patched_paginate(path, params=None, headers=None):
+        try:
+            yield from _orig_paginate(path, params=params, headers=headers)
+        except Exception:
+            if isinstance(path, str) and "additional_chat_templates" in path:
+                # CLIP and other non-LLM tokenizers don't have chat
+                # templates; the 404 is expected. Return empty.
+                return
+            raise
+
+    _pagination.paginate = _patched_paginate
+    _pagination._chat_template_404_patched = True
+
+
+# Apply the patch BEFORE any transformers import — transformers reads
+# huggingface_hub.utils._pagination.paginate at import time in some
+# versions. So this needs to run before `from transformers import ...`.
+_patch_hf_chat_template_404()
+
+
 import torch
 import numpy as np
 from PIL import Image
