@@ -56,8 +56,7 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
         f"N={config.prompt_length}|steps={config.num_steps}|"
         f"lr={config.learning_rate}|"
         f"wd={config.weight_decay}|dwd={config.delta_weight_decay}|"
-        f"R={config.num_rounds}|seed={config.seed}|"
-        f"clip={config.clip_model}"
+        f"R={config.num_rounds}|seed={config.seed}"
     )
     h.update(config_str.encode("utf-8"))
     return h.hexdigest()[:16]

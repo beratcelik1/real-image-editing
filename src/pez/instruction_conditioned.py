@@ -63,7 +63,7 @@ def _hash_pez2(
         f"lam={config.lambda_instruction}|gam={config.gamma_anchor}|"
         f"warm={config.warm_start}|"
         f"steps={config.num_steps}|lr={config.learning_rate}|"
-        f"seed={config.seed}|clip={config.clip_model}"
+        f"seed={config.seed}"
     )
     h.update(cfg_str.encode("utf-8"))
     return h.hexdigest()[:16]

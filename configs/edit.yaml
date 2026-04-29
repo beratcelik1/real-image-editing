@@ -8,8 +8,13 @@
 # and the source of each hyperparameter default below.
 
 # Stable Diffusion model.
-# The repo's existing src/utils.py loads SD2.1; keeping that.
-sd_model: stabilityai/stable-diffusion-2-1-base
+# SD 1.5 (CLIP-L/14, 768-dim text encoder) — matches the SD version
+# Hertz et al. (P2P) used to tune cross_replace_steps and other P2P
+# defaults below. SD 2.1 swaps in OpenCLIP-H/14 (1024-dim) and is
+# gated on HF (requires HF_TOKEN); switching back would break P2P
+# hyperparameter transfer and re-introduce auth friction. This mirror
+# org hosts the SD 1.5 weights publicly.
+sd_model: stable-diffusion-v1-5/stable-diffusion-v1-5
 
 # DDIM inversion + null-text optimization (existing src/inversion.py).
 ddim:

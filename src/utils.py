@@ -154,29 +154,30 @@ def load_sd_components(
 
     Args:
         device: Target device. Auto-detected if None.
-        model_id: HuggingFace model ID. Defaults to SD 2.1, falls back to SD 1.5
-                  if auth fails.
+        model_id: HuggingFace model ID. Defaults to SD 1.5 (public,
+                  non-gated; matches the SD version Hertz et al. tuned
+                  P2P on). SD 2.1 is supported but gated — pass it
+                  explicitly only if HF_TOKEN is set and you've accepted
+                  the model's terms.
     """
     if device is None:
         device = get_device()
     dtype = get_dtype(device)
 
     if model_id is None:
-        model_id = MODEL_ID_SD21
+        model_id = MODEL_ID_SD15
 
-    # SD 2.1-base is gated — without an HF token (or without having
-    # accepted the model's terms), HF returns 404 for every file in the
-    # repo. Fall back to SD 1.5 (non-gated) so the notebook still runs.
-    # Applies regardless of who supplied model_id, since callers reading
-    # from config can't know the auth state at runtime.
+    # If a caller explicitly passes the gated SD 2.1 and auth fails,
+    # fall back to SD 1.5 rather than crash. (No-op when model_id is
+    # already SD 1.5, which is the default path.)
     try:
         tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
     except OSError:
         if model_id == MODEL_ID_SD21:
             print(
                 f"Cannot access {model_id} (gated repo — accept terms at "
-                f"https://huggingface.co/{model_id} and set HF_TOKEN, or "
-                f"continue with SD 1.5). Falling back to SD 1.5."
+                f"https://huggingface.co/{model_id} and set HF_TOKEN). "
+                f"Falling back to SD 1.5."
             )
             model_id = MODEL_ID_SD15
             tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")

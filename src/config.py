@@ -55,8 +55,8 @@ class Pez1Config:
                                    # AdamW.weight_decay applied to Δ.
     batch_size: int
 
-    # Models
-    clip_model: str
+    # (No clip_model: continuous PEZ optimizes in SD's own text-encoder
+    # space — there's no separate CLIP load to configure.)
 
     # Alternating-optimization rounds
     num_rounds: int
@@ -90,8 +90,6 @@ class Pez2Config:
 
     num_steps: int
     learning_rate: float
-
-    clip_model: str
 
     cache_dir: str
     use_cache: bool
