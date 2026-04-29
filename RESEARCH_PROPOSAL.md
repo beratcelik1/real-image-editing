@@ -531,14 +531,14 @@ editing-time configuration.
   too much, anchor too tight) or over-edit on content (everything
   drifts, table-becomes-cat-style contamination). The mode separation
   encodes which behavior the user wants.
-- **Self-attention manipulation already partially in place.** v1
-  implements PnP-light: self-attention *map* swap via
+- **Self-attention preservation (Hertz P2P) already in place.** v1
+  implements Hertz et al.'s self-attention map swap via
   `self_attention.self_replace_steps` in `edit.yaml`, default 0.4.
   This applies to all modes (REPLACE included) and improves
-  structure preservation alongside cross-attention swap. STYLE
-  mode in R7 may need the *residual feature injection* half of
-  full PnP additionally (more invasive — hooks into UNet blocks,
-  not just attention processors). See §3.8 deviation notes.
+  structure preservation alongside cross-attention swap. This is
+  Hertz's mechanism, not Tumanyan PnP — for full PnP (residual
+  feature injection + decoder-layer restriction) STYLE mode (R7)
+  may layer on additional work. See §3.8 deviation notes.
 
 ### 3.1 PEZ on the source image (sub-claim 1)
 
@@ -1341,31 +1341,31 @@ DreamFusion). Listed for honest scoping and to pre-empt reviewer
   when it lands.
 - **`layer_indices` (which cross-attention layers): ✓ all (None
   default).** Matches Hertz's recommendation.
-- **Self-attention injection (PnP, Tumanyan et al. 2023): partially
-  implemented as "PnP-light" in v1.** We implement self-attention
-  *map* swap — source's self-attention probabilities are copied to
-  target for the first `self_replace_steps` fraction of denoising
-  (configurable in `edit.yaml`, `self_attention.self_replace_steps`,
-  default 0.4 per Hertz et al.'s word-swap recommendation). This is
-  the cheaper half of full PnP; it benefits all modes (REPLACE
-  included) by improving structure preservation alongside cross-
-  attention swap.
-  - **What v1 does NOT do:** the full Tumanyan PnP additionally
-    injects residual block features at specific U-Net layers, which
-    requires more invasive hooks (not just attention processor
-    replacement). Skipped because (a) it's substantially more code
-    against the diffusers UNet's internals and (b) the lighter
-    self-attention map swap delivers most of the benefit for
-    REPLACE-style edits.
-  - **For STYLE mode (R7):** if self-attention-map-swap proves
-    insufficient for global aesthetic shifts, R7 will add the
-    residual feature injection too. The architecture accommodates
-    this — `CrossAttentionController` already dispatches by
-    `is_cross`; adding hooks for residual block features is the
-    additional R7 work.
-  - **Reference implementation:** `external/plug-and-play/`
-    submodule (Tumanyan et al.'s original code, reads SD's vanilla
-    UNet not diffusers).
+- **Self-attention preservation (Hertz P2P): implemented in v1.**
+  Source's self-attention map is copied to target at all self-
+  attention layers for the first `self_replace_steps` fraction of
+  denoising (configurable in `edit.yaml`,
+  `self_attention.self_replace_steps`, default 0.4 per Hertz et
+  al.'s word-swap recommendation). This is the same mechanism Hertz
+  et al. 2022 describe as the self-attention companion to cross-
+  attention swap; it benefits all modes (REPLACE included) by
+  improving structure preservation.
+  - **Not the full Tumanyan PnP** (Tumanyan et al. 2023). Tumanyan
+    PnP additionally injects residual block features at specific
+    decoder layers and restricts attention injection to specific
+    decoder layers too. Hertz P2P self-attention preservation does
+    neither — applies map swap at all self-attention layers and
+    has no residual feature mechanism. Our v1 follows Hertz, not
+    Tumanyan.
+  - **For STYLE mode (R7):** if Hertz-style self-attention
+    preservation proves insufficient for global aesthetic shifts,
+    R7 may add the Tumanyan-PnP-specific extensions (residual
+    feature injection + decoder-layer restriction). For all v1
+    modes (REPLACE primarily), Hertz is the right reference.
+  - **Reference implementations:** `external/prompt-to-prompt/`
+    (Hertz et al.'s P2P with self-attention preservation, what we
+    follow for v1) and `external/plug-and-play/` (Tumanyan et al.'s
+    full PnP, what we'd add from for R7 if needed).
 
 **From Mokady et al. 2022 (Null-text Inversion):**
 - ✓ Followed: per-timestep null-text optimized for faithful
@@ -2046,13 +2046,15 @@ move toward style-axis" rather than "few positions move."
 - No changes to PEZ-1 or PEZ-2's algorithm — same machinery, just
   different operating point.
 
-**Status of self-attention manipulation.** The lighter half of PnP —
-self-attention map swap — was added in v1 (`self_replace_steps`
-config in `edit.yaml`; benefits all modes including REPLACE for
-better structure preservation). What R7 still needs is the *residual
-block feature injection* half of full PnP, which is more invasive
-(hooks into diffusers UNet's down/mid/up blocks at specific layers,
-beyond the attention-processor replacement that the v1 code uses).
+**Status of self-attention manipulation.** Hertz et al.'s P2P self-
+attention preservation was added in v1 (`self_replace_steps` config
+in `edit.yaml`; benefits all modes including REPLACE for better
+structure preservation). What R7 may still need from Tumanyan PnP
+is *residual block feature injection* + decoder-layer restriction
+— the parts that distinguish full PnP from Hertz's P2P self-attn.
+These are more invasive (hooks into diffusers UNet's down/mid/up
+blocks at specific layers, beyond the attention-processor replacement
+that the v1 code uses).
 
 **Open question — does residual feature injection materially help
 STYLE mode beyond what self-attention-map swap already provides?**
