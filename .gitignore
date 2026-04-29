@@ -10,6 +10,10 @@ build/
 *.safetensors
 outputs/
 data/
+# but DO commit small test images that ship with the repo for the
+# notebook's default config to work in fresh checkouts (Colab etc.)
+!data/examples/
+!data/examples/*
 *.docx
 *.pdf
 wandb/
