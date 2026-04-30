@@ -28,8 +28,13 @@ lambda_instruction: 1.0       # too low → no edit; too high → drift
 # ─── Warm-start anchor term ──────────────────────────────────────
 warm_start: true              # initialize soft_prompt = pez_1_embeddings.clone()
                               # (continuous identity copy, no vocab lookup)
-gamma_anchor: 0.1             # too low → per-position drift breaks
-                              # alignment; too high → no edit happens
+gamma_anchor: 10.0            # under L_anchor=.mean(), γ is a per-element
+                              # drift penalty independent of prompt_length.
+                              # 10 ≈ weak anchor (substantial drift, instruction
+                              # leads); 100 ≈ moderate anchor; 1000+ ≈ no edit.
+                              # NOTE: prior to the .sum()→.mean() switch, the
+                              # default was 0.1 — but that scaled with N×D=57,600
+                              # and was effectively γ≈5760 in current units.
 
 # ─── Optimization ────────────────────────────────────────────────
 # PEZ-2 is faster than PEZ-1 because warm-starting refines a near-

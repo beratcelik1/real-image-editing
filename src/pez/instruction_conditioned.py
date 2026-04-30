@@ -57,13 +57,21 @@ def _hash_pez2(
         dim=0,
     )
     h.update(null_text_stacked.numpy().tobytes())
+    # L_anchor formulation tag. Bump when the joint-loss formula
+    # changes in a way that shifts the optimum even for identical
+    # config (lam, gam, etc). "mean_v1" indicates L_anchor = .mean()
+    # over [1, N, D]. Prior "sum_v0" entries (from before the
+    # .sum()→.mean() switch) stay isolated and cannot be served as
+    # cache hits.
+    l_anchor_formulation = "mean_v1"
     cfg_str = (
         f"{config.source_loss_type}|cfg={config.cfg_scale}|"
         f"ts_sampling={config.timestep_sampling}|"
         f"lam={config.lambda_instruction}|gam={config.gamma_anchor}|"
         f"warm={config.warm_start}|"
         f"steps={config.num_steps}|lr={config.learning_rate}|"
-        f"seed={config.seed}|dtype={config.dtype}"
+        f"seed={config.seed}|dtype={config.dtype}|"
+        f"l_anchor={l_anchor_formulation}"
     )
     h.update(cfg_str.encode("utf-8"))
     return h.hexdigest()[:16]
@@ -229,11 +237,19 @@ def pez_invert_with_instruction(
         instr_pooled_n = F.normalize(instr_pooled.to(prompt_pooled.dtype), dim=-1)
         l_instr = -(prompt_pooled_n * instr_pooled_n).sum(dim=-1).mean()
 
-        # L_anchor: L2 to warm-start init
+        # L_anchor: per-element MEAN squared drift to warm-start init.
+        # Using .mean() (not .sum()) decouples the anchor magnitude from
+        # prompt_length × embedding_dim. With .sum() over [1, N=75, D=768]
+        # = 57,600 elements, even a "small" gamma ~0.2 gave a γ·L_anchor
+        # term ~50× larger than λ·L_instr (which is bounded in [-1, 1] by
+        # construction), so the anchor swamped the instruction signal at
+        # every grid point with substantial gamma. .mean() makes gamma
+        # interpretable as a per-element drift penalty in CLIP-embedding
+        # units that transfers across prompt_length.
         if soft_prompt_init_anchor is not None:
             l_anchor = (
                 (soft_prompt - soft_prompt_init_anchor.to(soft_prompt.dtype)) ** 2
-            ).sum()
+            ).mean()
         else:
             l_anchor = torch.tensor(0.0, device=device, dtype=soft_prompt.dtype)
 
