@@ -103,4 +103,4 @@ alignment_threshold: 0.95     # τ in RESEARCH_PROPOSAL.md §3.3.
                               # noisy on real PEZ-2 outputs.
 
 device: cuda
-dtype: float16
+dtype: float32
