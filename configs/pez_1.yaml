@@ -62,13 +62,18 @@ prompt_length: 75             # N positions in [N, 768]. The HARD MAX
                               # slots; PEZ-1's N stays the same.
 
 # ─── Optimization ────────────────────────────────────────────────
-num_steps: 3000               # PEZ optimization steps cap. More for
-                              # larger N or sds (vs clip). Bumped
-                              # from 1500 to 3000 for N=75 to give
-                              # the larger soft prompt room to
-                              # converge; adaptive early stopping in
-                              # pez_search shortcircuits when the
-                              # variable stops moving.
+num_steps: 1500               # PEZ optimization steps cap (per round).
+                              # Empirically: R0 (CLIP-cosine) converges
+                              # by ~500 steps even at N=75, so the prior
+                              # 3000 cap was wasted. R1+ (SDS) curves
+                              # are dominated by t/ε sampling noise —
+                              # additional steps under noise don't
+                              # reliably improve the result; the real
+                              # knob there is delta_weight_decay (and
+                              # whether R0 is allowed to over-converge,
+                              # which locks in the anchor). Adaptive
+                              # early stop in pez_search shortcircuits
+                              # when the variable stops moving.
 learning_rate: 0.1            # AdamW lr on the soft prompt
 
 # ─── Round-0 (vanilla PEZ) regularization ────────────────────────
