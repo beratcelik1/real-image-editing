@@ -253,6 +253,23 @@ def pez_search(
             loss_history_out=loss_history_out,
             progress_desc=progress_desc,
         )
+        # Diagnostic: report how far the residual actually drifted. SDS
+        # loss curves are dominated by t/ε sampling noise, so loss values
+        # don't reveal whether optimization is moving the parameter; ||Δ||
+        # does. ||Δ||/||anchor|| near 0 → wd is killing the SDS signal
+        # (try lowering delta_weight_decay). Non-trivial ratio → optimization
+        # moved meaningfully; visual A/B against the anchor confirms whether
+        # the move was useful.
+        with torch.no_grad():
+            delta_norm = delta.norm().item()
+            anchor_norm = anchor.norm().item()
+            rel = delta_norm / (anchor_norm + 1e-8)
+            tag = progress_desc or "pez_search (anchored)"
+            print(
+                f"[{tag}] final ||Δ|| = {delta_norm:.4f}, "
+                f"||anchor|| = {anchor_norm:.4f}, "
+                f"||Δ||/||anchor|| = {rel:.4f}"
+            )
         return (anchor + delta).detach()
 
     # Non-anchored path: optimize soft_prompt directly.
@@ -279,6 +296,7 @@ def pez_search(
     optimizer = torch.optim.AdamW(
         [soft_prompt], lr=learning_rate, weight_decay=weight_decay
     )
+    initial_for_movement = soft_prompt.detach().clone()
     _run_loop_with_early_stop(
         optimizer=optimizer,
         loss_fn_eval=lambda: loss_fn(soft_prompt),
@@ -287,4 +305,17 @@ def pez_search(
         loss_history_out=loss_history_out,
         progress_desc=progress_desc,
     )
+    # Diagnostic: how far did the soft prompt drift from its starting
+    # point? Same rationale as the anchored branch above.
+    with torch.no_grad():
+        sp = soft_prompt.detach()
+        move = (sp - initial_for_movement).norm().item()
+        sp_norm = sp.norm().item()
+        rel = move / (sp_norm + 1e-8)
+        tag = progress_desc or "pez_search"
+        print(
+            f"[{tag}] final ||soft_prompt - init|| = {move:.4f}, "
+            f"||soft_prompt|| = {sp_norm:.4f}, "
+            f"relative = {rel:.4f}"
+        )
     return soft_prompt.detach()
