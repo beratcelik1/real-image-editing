@@ -14,12 +14,22 @@ def ddim_inversion(
     unet: UNet2DConditionModel,
     scheduler: DDIMScheduler,
     num_steps: int = 50,
-    cfg_scale: float = 7.5,
+    cfg_scale: float = 1.0,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Run DDIM inversion: encode image latent into noise space.
 
     Goes forward in diffusion time (t=0 -> t=T), adding noise at each step
     using the model's own noise predictions.
+
+    cfg_scale defaults to 1.0 — Mokady et al. 2022 (null-text inversion)
+    and Hertz et al. 2022 (P2P) both require CFG=1.0 for the inversion
+    pass. With CFG > 1, each step extrapolates past the conditional
+    prediction (eps = (1+s)·eps_cond - s·eps_uncond) instead of
+    inverting along the diffusion trajectory, so z_T no longer
+    represents the source image — denoising it produces garbage even
+    before any P2P injection. Null-text optimization (in the next stage)
+    is what compensates for the gap between CFG=1 inversion and CFG=7.5
+    denoising.
 
     Returns:
         latent_T: The fully inverted noisy latent at timestep T.

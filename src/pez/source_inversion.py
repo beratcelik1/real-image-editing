@@ -61,6 +61,12 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
     h.update(image.tobytes())
     h.update(image.size[0].to_bytes(4, "little"))
     h.update(image.size[1].to_bytes(4, "little"))
+    # ddim_inversion is now hardcoded to CFG=1 (Mokady-style); previous
+    # behavior was CFG=config.cfg_scale (=7.5), which produces a
+    # CFG-extrapolated trajectory rather than a true inversion. Tag the
+    # algorithm version explicitly so cache entries from the broken
+    # CFG=7.5 era can't be served as hits.
+    _INVERSION_ALGO_VERSION = "cfg1_v1"
     config_str = (
         f"{config.loss_type}|cfg={config.cfg_scale}|"
         f"ts_sampling={config.timestep_sampling}|"
@@ -70,7 +76,8 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
         f"wd={config.weight_decay}|dwd={config.delta_weight_decay}|"
         f"R={config.num_rounds}|seed={config.seed}|"
         f"dtype={config.dtype}|"
-        f"nt_opt_steps={_NULL_TEXT_OPT_STEPS}|nt_opt_lr={_NULL_TEXT_OPT_LR}"
+        f"nt_opt_steps={_NULL_TEXT_OPT_STEPS}|nt_opt_lr={_NULL_TEXT_OPT_LR}|"
+        f"inv_algo={_INVERSION_ALGO_VERSION}"
     )
     h.update(config_str.encode("utf-8"))
     return h.hexdigest()[:16]
@@ -214,7 +221,9 @@ def pez_invert_source(
             unet,
             scheduler,
             num_steps=config.ddim_num_steps,
-            cfg_scale=config.cfg_scale,
+            cfg_scale=1.0,  # Mokady-style: CFG=1 for inversion. config.cfg_scale (typically 7.5)
+                            # is the *denoising* scale used by null-text optimization below
+                            # and at edit time — null-text bridges the CFG=1↔CFG=7.5 gap.
         )
 
         # 5b. Null-text optimization with the existing implementation.

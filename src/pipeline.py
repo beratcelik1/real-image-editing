@@ -295,7 +295,7 @@ def prepare_p2p_inputs(
         image_latent, source_emb, uncond_emb,
         unet, scheduler,
         num_steps=edit_config.ddim.num_steps,
-        cfg_scale=edit_config.ddim.cfg_scale,
+        cfg_scale=1.0,  # Mokady-style: CFG=1 for inversion, =edit_config.ddim.cfg_scale for denoising
     )
     return {
         "z_T": z_T,
@@ -449,7 +449,7 @@ def run_p2p_edit(
             image_latent, source_emb, uncond_emb,
             unet, scheduler,
             num_steps=edit_config.ddim.num_steps,
-            cfg_scale=edit_config.ddim.cfg_scale,
+            cfg_scale=1.0,  # Mokady-style: CFG=1 for inversion (denoising uses edit_config.ddim.cfg_scale below)
         )
     else:
         z_T = cached_z_T.to(device=device, dtype=dtype)
