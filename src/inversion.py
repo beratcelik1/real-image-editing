@@ -70,14 +70,25 @@ def _ddim_inversion_step(
     timestep_idx = int(
         (scheduler.timesteps == timestep).nonzero(as_tuple=True)[0].item()
     )
-    # Next timestep in forward diffusion (higher noise). At the highest
-    # denoising-step index (idx=0 in scheduler.timesteps order), advance
-    # to the highest-noise training timestep so the inversion still
-    # noises the latent on its final iteration. Using the same timestep
-    # makes alpha_prod_t == alpha_prod_t_next and the update degenerates
-    # to identity — silently dropping the last step of inversion.
+    # Next timestep in forward diffusion (higher noise).
+    #
+    # At the highest denoising-step index (idx=0 in scheduler.timesteps
+    # order — i.e., the LAST iteration of `reversed(scheduler.timesteps)`),
+    # we deliberately set next_timestep = timestep. That makes the
+    # update `alpha.sqrt() * pred_x0 + (1-alpha).sqrt() * eps = sample`,
+    # i.e., an identity step on the final inversion iteration.
+    #
+    # This is NOT a missed inversion step. It's the contract with the
+    # editing/denoising loop, which iterates scheduler.timesteps in
+    # forward order [t_max, ..., t_min] and assumes its starting latent
+    # is at noise level alpha[t_max] = alpha[scheduler.timesteps[0]].
+    # If we noised past alpha[t_max] (e.g., to alpha[num_train_timesteps - 1]),
+    # the very first denoising step would treat that more-noised latent
+    # as if it were at alpha[t_max], producing a corrupted reconstruction
+    # — visible as washed-out / bad even on the BLIP baseline that
+    # bypasses PEZ entirely.
     if timestep_idx == 0:
-        next_timestep = scheduler.config.num_train_timesteps - 1
+        next_timestep = int(timestep) if hasattr(timestep, "__int__") else timestep
     else:
         next_timestep = int(scheduler.timesteps[timestep_idx - 1].item())
 
