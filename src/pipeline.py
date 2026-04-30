@@ -408,19 +408,34 @@ def run_p2p_edit(
     device = torch.device(edit_config.device)
     dtype = _str_to_dtype(edit_config.dtype)
 
-    # Normalize shapes: caller may hand us [N, D] or [1, N, D].
-    src = _ensure_batched(source_embeddings).to(device=device)
-    tgt = _ensure_batched(target_embeddings).to(device=device)
+    # Normalize shapes: caller may hand us [N, D] or [1, N, D]. The
+    # `.to(device=...)` is deferred until we actually need the raw
+    # [1, N, D] embeddings, since the sweep-loop hot path passes all of
+    # cached_{source,target,uncond}_emb plus cached_alignment and never
+    # consumes src/tgt. Skipping the unused .to() saves two device
+    # copies per inner-loop iteration.
+    src_raw = _ensure_batched(source_embeddings)
+    tgt_raw = _ensure_batched(target_embeddings)
+
+    def _src_on_device() -> torch.Tensor:
+        return src_raw.to(device=device)
+
+    def _tgt_on_device() -> torch.Tensor:
+        return tgt_raw.to(device=device)
 
     source_emb = (
         cached_source_emb.to(device=device, dtype=dtype)
         if cached_source_emb is not None
-        else encode_continuous_prompt(src, text_encoder, tokenizer, dtype)
+        else encode_continuous_prompt(
+            _src_on_device(), text_encoder, tokenizer, dtype,
+        )
     )
     target_emb = (
         cached_target_emb.to(device=device, dtype=dtype)
         if cached_target_emb is not None
-        else encode_continuous_prompt(tgt, text_encoder, tokenizer, dtype)
+        else encode_continuous_prompt(
+            _tgt_on_device(), text_encoder, tokenizer, dtype,
+        )
     )
     uncond_emb = (
         cached_uncond_emb.to(device=device, dtype=dtype)
@@ -465,7 +480,7 @@ def run_p2p_edit(
         matched, unmapped_target = cached_alignment
     else:
         matched, unmapped_target = align_pez_prompts(
-            src.squeeze(0), tgt.squeeze(0),
+            _src_on_device().squeeze(0), _tgt_on_device().squeeze(0),
             threshold=edit_config.alignment_threshold,
             method=edit_config.alignment_method,
         )

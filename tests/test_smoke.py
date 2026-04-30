@@ -209,7 +209,14 @@ def test_torch_pez_imports():
 
 @pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")
 def test_torch_local_blend_step_idempotent():
-    """LocalBlend.step() is idempotent within a denoising step."""
+    """LocalBlend.step() is idempotent within a denoising step.
+
+    Sequence: record (sets accumulator), step() (finalize, arm guard),
+    step() again (no-op), record (clears guard for next step), step()
+    (finalize again). The guard is keyed off the
+    ``record_cross_attention`` → ``step`` ordering, which mirrors how
+    the controller drives the LocalBlend in practice.
+    """
     import torch
     from attention_control.local_blend import LocalBlend
 
@@ -218,36 +225,25 @@ def test_torch_local_blend_step_idempotent():
     attn = torch.rand(2, 4, 64, 77)
     lb.record_cross_attention(attn)
 
-    # First step() finalizes
-    initial_step_id = lb._cur_step
-    lb.step()
-    assert lb._cur_step == initial_step_id + 1
-    # Second step() within the same denoising step is a no-op
-    # (but lb._cur_step has advanced, so we test by calling again with
-    # _finalized_step_id manually rolled back to simulate a second
-    # caller in the same denoising step):
-    lb._finalized_step_id = lb._cur_step - 1   # simulate "already advanced"
+    # First step() finalizes and advances _cur_step.
     pre = lb._cur_step
     lb.step()
-    # Since _finalized_step_id is now == _cur_step - 1 ... wait, this
-    # test is hard to write cleanly because the guard state-machine is
-    # subtle. The core assertion: calling step() twice doesn't
-    # double-advance _cur_step.
-    # Actually with the current implementation: if _cur_step ==
-    # _finalized_step_id, the call is a no-op. After step() advances
-    # _cur_step beyond the finalized id, a second call will finalize
-    # again (correct for a NEW denoising step). The guard works on
-    # within-step double-calls, which require both controllers to call
-    # before _cur_step advances.
-    # For a clean test we'd need to interleave the calls more carefully.
-    # The simpler test: setting _finalized_step_id == _cur_step makes
-    # the next call a no-op:
-    lb._finalized_step_id = lb._cur_step
+    assert lb._cur_step == pre + 1
+    assert lb._step_finalized is True
+
+    # Second step() within the SAME denoising step is a no-op: no
+    # `record_cross_attention` happened in between to clear the guard.
     pre = lb._cur_step
-    lb.step()  # no-op
-    assert lb._cur_step == pre, (
-        "step() should be a no-op when _finalized_step_id == _cur_step"
-    )
+    lb.step()
+    assert lb._cur_step == pre, "second within-step call must not advance"
+
+    # Next denoising step: a record() clears the guard, then step()
+    # finalizes again and advances.
+    lb.record_cross_attention(attn)
+    assert lb._step_finalized is False
+    pre = lb._cur_step
+    lb.step()
+    assert lb._cur_step == pre + 1
 
 
 @pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")

@@ -79,9 +79,12 @@ class LocalBlend:
         # record_cross_attention during this step's denoising).
         self._accumulator_sum: torch.Tensor | None = None
         self._accumulator_count: int = 0
-        # Idempotency guard for step().
-        self._finalized_step_id: int = -1
-        # Number of denoising steps observed (for the guard).
+        # Idempotency guard for step(). True iff `step()` has already
+        # finalized this denoising step's mask; reset by the first
+        # `record_cross_attention` of the next denoising step (that's
+        # the externally observable "new step starts" signal).
+        self._step_finalized: bool = False
+        # Number of denoising steps observed.
         self._cur_step: int = 0
 
     # ------------------------------------------------------------------
@@ -105,6 +108,11 @@ class LocalBlend:
         bsz, heads, spatial, tokens = attn_4d.shape
         if bsz < 2:
             return  # Single-prompt run, no target row to record
+
+        # First record after a finalize() marks the start of a new
+        # denoising step — clear the guard so step() will finalize again.
+        if self._step_finalized:
+            self._step_finalized = False
 
         # Take only the last batch row (cond_tgt under CFG, tgt
         # without). Average across heads, select the configured target
@@ -191,14 +199,12 @@ class LocalBlend:
         accumulator.
 
         Idempotent: callable multiple times within a single denoising
-        step (only the first call finalizes). Reserved for the case
-        where multiple controllers all call this; in the P2P-only
-        configuration, ``CrossAttentionController.step`` is the only
-        caller.
+        step (only the first call finalizes). The `_step_finalized`
+        flag is cleared by the next `record_cross_attention`, which
+        externally signals the start of a new denoising step.
         """
-        if self._cur_step == self._finalized_step_id:
-            return  # Already finalized for this step
-        self._finalized_step_id = self._cur_step
+        if self._step_finalized:
+            return  # Already finalized for this denoising step
 
         if self._accumulator_sum is not None and self._accumulator_count > 0:
             avg = self._accumulator_sum / self._accumulator_count
@@ -219,9 +225,10 @@ class LocalBlend:
 
             self._current_mask = binary
 
-        # Reset accumulator for the NEXT step.
+        # Reset accumulator for the NEXT step and arm the guard.
         self._accumulator_sum = None
         self._accumulator_count = 0
+        self._step_finalized = True
         self._cur_step += 1
 
     def reset(self) -> None:
@@ -229,5 +236,5 @@ class LocalBlend:
         self._current_mask = None
         self._accumulator_sum = None
         self._accumulator_count = 0
-        self._finalized_step_id = -1
+        self._step_finalized = False
         self._cur_step = 0

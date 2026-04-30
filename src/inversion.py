@@ -67,18 +67,23 @@ def _ddim_inversion_step(
 
     Reverses the DDIM denoising formula to add noise.
     """
-    # Get the next timestep (one step further into noise)
-    prev_timestep = timestep
-    timestep_idx = (scheduler.timesteps == timestep).nonzero(as_tuple=True)[0]
-    # Next timestep in forward diffusion (higher noise)
+    timestep_idx = int(
+        (scheduler.timesteps == timestep).nonzero(as_tuple=True)[0].item()
+    )
+    # Next timestep in forward diffusion (higher noise). At the highest
+    # denoising-step index (idx=0 in scheduler.timesteps order), advance
+    # to the highest-noise training timestep so the inversion still
+    # noises the latent on its final iteration. Using the same timestep
+    # makes alpha_prod_t == alpha_prod_t_next and the update degenerates
+    # to identity — silently dropping the last step of inversion.
     if timestep_idx == 0:
-        next_timestep = timestep  # Already at highest noise
+        next_timestep = scheduler.config.num_train_timesteps - 1
     else:
-        next_timestep = scheduler.timesteps[timestep_idx - 1]
+        next_timestep = int(scheduler.timesteps[timestep_idx - 1].item())
 
     # alpha and alpha_prev for the DDIM formula (match sample device + dtype)
     dev, dt = sample.device, sample.dtype
-    alpha_prod_t = scheduler.alphas_cumprod[prev_timestep].to(dev, dtype=dt)
+    alpha_prod_t = scheduler.alphas_cumprod[timestep].to(dev, dtype=dt)
     alpha_prod_t_next = (
         scheduler.alphas_cumprod[next_timestep].to(dev, dtype=dt)
         if next_timestep >= 0
@@ -105,10 +110,14 @@ def _ddim_step_inline(
 
     Needed because scheduler.step() may break the gradient graph.
     """
-    # Find previous timestep
-    step_idx = (scheduler.timesteps == timestep).nonzero(as_tuple=True)[0]
+    # Find previous timestep. nonzero(...) returns a 1-element tensor;
+    # collapse to a Python int so prev_timestep stays scalar (a length-1
+    # tensor would broadcast in (1 - alpha_prod_prev).sqrt()).
+    step_idx = int(
+        (scheduler.timesteps == timestep).nonzero(as_tuple=True)[0].item()
+    )
     if step_idx + 1 < len(scheduler.timesteps):
-        prev_timestep = scheduler.timesteps[step_idx + 1]
+        prev_timestep = int(scheduler.timesteps[step_idx + 1].item())
     else:
         prev_timestep = 0
 
@@ -187,29 +196,38 @@ def null_text_optimization(
         )
         optimizer = torch.optim.Adam([uncond_emb], lr=lr)
 
+        # The conditional noise prediction depends only on `latent` and
+        # `text_embeddings` — both constant across the inner loop — so
+        # compute it once under no_grad. Doing the conditional inside the
+        # inner loop wastes ~half the per-step activation memory because
+        # the autograd graph for that branch can never reach uncond_emb.
+        latent_in_single = latent.detach()
+        with torch.no_grad():
+            noise_pred_text = unet(
+                latent_in_single,
+                t,
+                encoder_hidden_states=text_embeddings,
+            ).sample
+
         for _ in range(opt_steps):
             # Cast to model dtype for UNet forward pass
             uncond_emb_cast = uncond_emb.to(model_dtype)
 
-            # Predict noise with current null embedding
-            latent_input = torch.cat([latent.detach()] * 2)
-            embed_input = torch.cat([uncond_emb_cast, text_embeddings])
-
-            noise_pred = unet(
-                latent_input,
+            # Only the uncond branch needs a grad-enabled forward.
+            noise_pred_uncond = unet(
+                latent_in_single,
                 t,
-                encoder_hidden_states=embed_input,
+                encoder_hidden_states=uncond_emb_cast,
             ).sample
 
             # Apply CFG
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred_cfg = noise_pred_uncond + cfg_scale * (
                 noise_pred_text - noise_pred_uncond
             )
 
             # Inline DDIM step (differentiable, unlike scheduler.step())
             prev_latent = _ddim_step_inline(
-                noise_pred_cfg, t, latent.detach(), scheduler
+                noise_pred_cfg, t, latent_in_single, scheduler
             )
 
             # Loss: predicted latent should match the pivot from inversion

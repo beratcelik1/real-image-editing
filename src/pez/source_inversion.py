@@ -36,6 +36,13 @@ from src.utils import encode_image, get_uncond_embeddings, load_sd_components
 # ---------------------------------------------------------------------------
 
 
+# Hardcoded null-text optimization hyperparameters for the calls below.
+# Folded into the cache key so editing them in code invalidates stale
+# runs even though they aren't config knobs today.
+_NULL_TEXT_OPT_STEPS = 10
+_NULL_TEXT_OPT_LR = 1e-2
+
+
 def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
     """Hash key for caching: image bytes + every config field that
     affects the optimization result.
@@ -43,6 +50,11 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
     Includes (Bug #4 fix): weight_decay (round-0 reg), delta_weight_decay
     (round-1+ residual anchor — the new key knob from §3.1), learning_rate,
     timestep_sampling. Tuning any of these changes the output, so they
+    must invalidate the cache.
+
+    Also includes config.dtype (changes U-Net forward output and thus the
+    SDS gradient) and the hardcoded null-text-optim hyperparameters
+    (`_NULL_TEXT_OPT_STEPS`, `_NULL_TEXT_OPT_LR`); editing them in code
     must invalidate the cache.
     """
     h = hashlib.sha256()
@@ -56,7 +68,9 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
         f"N={config.prompt_length}|steps={config.num_steps}|"
         f"lr={config.learning_rate}|"
         f"wd={config.weight_decay}|dwd={config.delta_weight_decay}|"
-        f"R={config.num_rounds}|seed={config.seed}"
+        f"R={config.num_rounds}|seed={config.seed}|"
+        f"dtype={config.dtype}|"
+        f"nt_opt_steps={_NULL_TEXT_OPT_STEPS}|nt_opt_lr={_NULL_TEXT_OPT_LR}"
     )
     h.update(config_str.encode("utf-8"))
     return h.hexdigest()[:16]
@@ -212,8 +226,8 @@ def pez_invert_source(
             scheduler,
             num_steps=config.ddim_num_steps,
             cfg_scale=config.cfg_scale,
-            opt_steps=10,
-            lr=1e-2,
+            opt_steps=_NULL_TEXT_OPT_STEPS,
+            lr=_NULL_TEXT_OPT_LR,
         )
 
         # 5c. SDS-PEZ refinement with frozen null-text.
