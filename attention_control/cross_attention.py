@@ -457,6 +457,14 @@ class P2PAttnProcessor:
 # ---------------------------------------------------------------------------
 
 
+# Attribute name on the U-Net used to stash the original processors
+# between register/unregister, so we can restore them exactly. We
+# cannot rely on diffusers' `set_default_attn_processor` because it
+# refuses to run when the current processors are custom subclasses
+# (it type-checks the *current* processors, not the *target* default).
+_ORIGINAL_PROCS_ATTR = "_real_image_editing_original_attn_procs"
+
+
 def register_attention_control(
     unet,
     controller: CrossAttentionController,
@@ -465,7 +473,15 @@ def register_attention_control(
 
     The controller's ``layer_indices`` determines which layers are
     *edited*; all layers are instrumented for attention-map storage.
+    Snapshots the previous processors on the U-Net so
+    :func:`unregister_attention_control` can restore them.
     """
+    # Snapshot the existing processors once; if register is called twice
+    # (e.g. because a prior unregister was skipped), keep the FIRST
+    # snapshot so we still restore back to truly-original state.
+    if not hasattr(unet, _ORIGINAL_PROCS_ATTR):
+        setattr(unet, _ORIGINAL_PROCS_ATTR, dict(unet.attn_processors))
+
     attn_procs: dict[str, P2PAttnProcessor] = {}
 
     for idx, name in enumerate(unet.attn_processors.keys()):
@@ -484,5 +500,19 @@ def register_attention_control(
 
 
 def unregister_attention_control(unet) -> None:
-    """Restore the default attention processors on *unet*."""
-    unet.set_default_attn_processor()
+    """Restore the original attention processors on *unet*.
+
+    Uses the snapshot taken in :func:`register_attention_control`. We
+    can't use ``unet.set_default_attn_processor()`` here because
+    diffusers type-checks the *current* processors and refuses when
+    they're custom subclasses like :class:`P2PAttnProcessor`.
+    """
+    original = getattr(unet, _ORIGINAL_PROCS_ATTR, None)
+    if original is not None:
+        unet.set_attn_processor(dict(original))
+        delattr(unet, _ORIGINAL_PROCS_ATTR)
+    else:
+        # No snapshot — fall back to diffusers' default reset. This is
+        # only reachable if the caller invokes unregister without a
+        # matching register; preserved for safety.
+        unet.set_default_attn_processor()
