@@ -77,6 +77,7 @@ def pez_invert_source(
     sd_components: dict | None = None,
     clip_image_features: torch.Tensor | None = None,
     text_projection: torch.nn.Linear | None = None,
+    losses_out: dict[str, list[float]] | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Run PEZ-1 alternating R=N pipeline on a source image.
 
@@ -114,6 +115,10 @@ def pez_invert_source(
         Optional ``CLIPModel.text_projection`` for the joint-space
         comparison. If None, comparison is in the text encoder's
         native output space.
+    losses_out
+        Optional dict to capture per-step loss histories. Populated with
+        ``{"round_0": [...], "round_1": [...], ...}`` (one list per
+        alternating-optimization round). Empty / unchanged on cache hit.
     """
     # 1. Cache check
     image_hash = _hash_image_and_config(image, config)
@@ -156,6 +161,10 @@ def pez_invert_source(
         )
 
     print("[PEZ-1 Round 0] vanilla PEZ bootstrap (CLIP-cosine loss)")
+    round_0_losses: list[float] | None = None
+    if losses_out is not None:
+        round_0_losses = []
+        losses_out["round_0"] = round_0_losses
     soft_prompt = pez_search(
         loss_fn=_clip_loss_fn,
         token_embedding=token_embedding,
@@ -166,6 +175,8 @@ def pez_invert_source(
         seed=config.seed,
         device=device,
         initial_soft_prompt=None,
+        loss_history_out=round_0_losses,
+        progress_desc="PEZ-1 R0 (CLIP)",
     )  # [1, N, D]
 
     # 5. Round 1..R — alternating null-text + SDS-PEZ refinement
@@ -236,6 +247,10 @@ def pez_invert_source(
         # Residual parameterization for SDS rounds (proposal §3.1):
         # anchor_to = previous round's output, optimize Δ (init at 0).
         # weight_decay = delta_weight_decay (anchor strength on Δ).
+        round_losses: list[float] | None = None
+        if losses_out is not None:
+            round_losses = []
+            losses_out[f"round_{round_idx}"] = round_losses
         soft_prompt = pez_search(
             loss_fn=_sds_loss_fn,
             token_embedding=token_embedding,
@@ -246,6 +261,8 @@ def pez_invert_source(
             seed=config.seed + round_idx,
             device=device,
             anchor_to=soft_prompt,
+            loss_history_out=round_losses,
+            progress_desc=f"PEZ-1 R{round_idx} (SDS)",
         )
 
     # 6. Cache and return

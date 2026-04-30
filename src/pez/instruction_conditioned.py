@@ -76,6 +76,7 @@ def pez_invert_with_instruction(
     null_text_per_timestep: list[torch.Tensor],
     config: Pez2Config,
     sd_components: dict,
+    losses_out: dict[str, list[float]] | None = None,
 ) -> torch.Tensor:
     """Run PEZ-2 with the three-term joint loss.
 
@@ -96,6 +97,14 @@ def pez_invert_with_instruction(
         Dict ``{"unet", "vae", "text_encoder", "tokenizer", "scheduler"}``.
         Required (no internal load). Passed by the caller for cost
         amortization across multiple PEZ-2 runs on the same image.
+
+    losses_out
+        Optional dict to capture per-step loss histories. Populated with
+        ``{"total": [...], "l_source": [...], "lam_l_instr": [...],
+        "gam_l_anchor": [...]}`` (each list one entry per optimization
+        step). The two component lists are the *weighted* values
+        (λ·L_instr, γ·L_anchor) so they sum directly to ``total`` and
+        plot on a comparable scale. Empty / unchanged on cache hit.
 
     Returns
     -------
@@ -159,6 +168,15 @@ def pez_invert_with_instruction(
         soft_prompt_init.detach().clone() if soft_prompt_init is not None else None
     )
 
+    # Per-term loss capture: the joint closure populates these lists
+    # one entry per gradient step. Each step calls _joint_loss_fn exactly
+    # once (see _run_loop_with_early_stop), so no double-counting.
+    if losses_out is not None:
+        losses_out.setdefault("total", [])
+        losses_out.setdefault("l_source", [])
+        losses_out.setdefault("lam_l_instr", [])
+        losses_out.setdefault("gam_l_anchor", [])
+
     # Build the joint loss closure
     def _joint_loss_fn(soft_prompt: torch.Tensor) -> torch.Tensor:
         # Encode the soft prompt through CLIP once and reuse the
@@ -219,19 +237,31 @@ def pez_invert_with_instruction(
         else:
             l_anchor = torch.tensor(0.0, device=device, dtype=soft_prompt.dtype)
 
-        return (
-            l_source
-            + config.lambda_instruction * l_instr
-            + config.gamma_anchor * l_anchor
-        )
+        lam_l_instr = config.lambda_instruction * l_instr
+        gam_l_anchor = config.gamma_anchor * l_anchor
+        total = l_source + lam_l_instr + gam_l_anchor
+
+        if losses_out is not None:
+            losses_out["l_source"].append(l_source.detach().item())
+            losses_out["lam_l_instr"].append(lam_l_instr.detach().item())
+            losses_out["gam_l_anchor"].append(gam_l_anchor.detach().item())
+            losses_out["total"].append(total.detach().item())
+
+        return total
 
     print(f"[PEZ-2] instruction-conditioned optimization: {instruction!r}")
+    # NOTE: don't pass loss_history_out= here — _joint_loss_fn already
+    # appends to losses_out["total"], so passing it would double-count.
     target_embeddings = pez_search(
         loss_fn=_joint_loss_fn,
         token_embedding=token_embedding,
         prompt_length=prompt_length,
         num_steps=config.num_steps,
         learning_rate=config.learning_rate,
+        progress_desc=(
+            f"PEZ-2 (lam={config.lambda_instruction:g}, "
+            f"gam={config.gamma_anchor:g})"
+        ),
         # PEZ-2's anchor is the L_anchor term in the joint loss above
         # (||soft_prompt - soft_prompt_init||² with γ = gamma_anchor).
         # AdamW.weight_decay is hardcoded to 0.0 — NOT a config knob —

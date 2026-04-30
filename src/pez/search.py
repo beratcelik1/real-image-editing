@@ -23,6 +23,7 @@ from typing import Callable
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,8 @@ def _run_loop_with_early_stop(
     loss_fn_eval: Callable[[], torch.Tensor],
     var: torch.Tensor,                 # the optimization variable, for movement tracking
     num_steps: int,
+    loss_history_out: list[float] | None = None,
+    progress_desc: str | None = None,
 ) -> None:
     """Run AdamW optimization with movement-based adaptive early stopping.
 
@@ -58,30 +61,49 @@ def _run_loop_with_early_stop(
     (so callers can wrap soft_prompt = anchor + Δ or pass soft_prompt
     directly). `var` is the parameter whose relative L2 movement we
     monitor for the early-stop criterion.
-    """
-    prev_check = var.detach().clone()
-    for step in range(num_steps):
-        loss = loss_fn_eval()
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
 
-        if (
-            step >= _EARLY_STOP_MIN_STEPS
-            and (step + 1) % _EARLY_STOP_CHECK_INTERVAL == 0
-        ):
-            with torch.no_grad():
-                cur = var.detach()
-                rel_move = (cur - prev_check).norm() / (cur.norm() + 1e-8)
-            if rel_move.item() < _EARLY_STOP_REL_THRESHOLD:
-                print(
-                    f"[pez_search] early stop at step {step+1}/{num_steps} "
-                    f"(rel L2 movement {rel_move.item():.2e} < "
-                    f"{_EARLY_STOP_REL_THRESHOLD:.0e} over last "
-                    f"{_EARLY_STOP_CHECK_INTERVAL} steps)"
-                )
-                return
-            prev_check = cur.clone()
+    If ``loss_history_out`` is provided, the per-step total loss is
+    appended to it (one ``.item()`` GPU→CPU sync per step; ~ms,
+    negligible vs the SDS step cost). If ``progress_desc`` is provided,
+    a tqdm bar is shown with the current loss in the postfix (refreshed
+    every ``_EARLY_STOP_CHECK_INTERVAL`` steps).
+    """
+    pbar = tqdm(range(num_steps), desc=progress_desc) if progress_desc else None
+    iter_range = pbar if pbar is not None else range(num_steps)
+    prev_check = var.detach().clone()
+    try:
+        for step in iter_range:
+            loss = loss_fn_eval()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if loss_history_out is not None:
+                loss_history_out.append(loss.detach().item())
+
+            if (step + 1) % _EARLY_STOP_CHECK_INTERVAL == 0:
+                if pbar is not None:
+                    pbar.set_postfix(loss=f"{loss.item():.4f}")
+                if step >= _EARLY_STOP_MIN_STEPS:
+                    with torch.no_grad():
+                        cur = var.detach()
+                        rel_move = (cur - prev_check).norm() / (cur.norm() + 1e-8)
+                    if rel_move.item() < _EARLY_STOP_REL_THRESHOLD:
+                        msg = (
+                            f"[pez_search] early stop at step {step+1}/{num_steps} "
+                            f"(rel L2 movement {rel_move.item():.2e} < "
+                            f"{_EARLY_STOP_REL_THRESHOLD:.0e} over last "
+                            f"{_EARLY_STOP_CHECK_INTERVAL} steps)"
+                        )
+                        if pbar is not None:
+                            pbar.write(msg)
+                        else:
+                            print(msg)
+                        return
+                    prev_check = cur.clone()
+    finally:
+        if pbar is not None:
+            pbar.close()
 
 
 def nn_project(
@@ -136,6 +158,8 @@ def pez_search(
     device: torch.device,
     initial_soft_prompt: torch.Tensor | None = None,
     anchor_to: torch.Tensor | None = None,
+    loss_history_out: list[float] | None = None,
+    progress_desc: str | None = None,
 ) -> torch.Tensor:
     """Run the continuous-PEZ optimization loop with a caller-supplied loss.
 
@@ -226,6 +250,8 @@ def pez_search(
             loss_fn_eval=lambda: loss_fn(anchor + delta),
             var=delta,
             num_steps=num_steps,
+            loss_history_out=loss_history_out,
+            progress_desc=progress_desc,
         )
         return (anchor + delta).detach()
 
@@ -258,5 +284,7 @@ def pez_search(
         loss_fn_eval=lambda: loss_fn(soft_prompt),
         var=soft_prompt,
         num_steps=num_steps,
+        loss_history_out=loss_history_out,
+        progress_desc=progress_desc,
     )
     return soft_prompt.detach()
