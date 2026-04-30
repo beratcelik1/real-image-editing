@@ -98,9 +98,18 @@ mode: replace
 # (Legacy "lcs" / "semantic" methods removed — see RESEARCH_PROPOSAL.md
 #  Appendix B for alternatives if cosine threshold proves insufficient.)
 alignment_method: cosine_threshold
-alignment_threshold: 0.95     # τ in RESEARCH_PROPOSAL.md §3.3.
-                              # Sweep (0.90, 0.99) if alignment proves
-                              # noisy on real PEZ-2 outputs.
+alignment_threshold: 0.85     # τ in RESEARCH_PROPOSAL.md §3.3.
+                              # Lowered 0.95 → 0.85: at 0.95, even modest
+                              # PEZ-2 drift (||Δ||/||anchor|| ≈ 0.2) leaves
+                              # all per-position cosines above τ, so every
+                              # position is "aligned" and source-side
+                              # cross-attention is injected everywhere →
+                              # P2P swap becomes a no-op and no edit
+                              # appears regardless of (λ, γ). 0.85 lets a
+                              # handful of drifted positions become
+                              # "unmapped" so target features actually
+                              # drive the cross-attention there.
+                              # Sweep (0.80, 0.90) if edits drift too far.
 
 device: cuda
 dtype: float32

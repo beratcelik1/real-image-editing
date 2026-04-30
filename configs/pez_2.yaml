@@ -48,7 +48,14 @@ num_steps: 600                # cap; bumped from 300 to 600 to give
                               # Adaptive early stopping in pez_search
                               # shortcircuits when convergence is
                               # detected.
-learning_rate: 0.05           # lower than PEZ-1 since we're refining
+learning_rate: 0.1            # bumped 0.05 → 0.1 (matches PEZ-1) so the
+                              # joint-loss optimization actually converges
+                              # in num_steps under the .mean()-formulation
+                              # γ regime — at γ=10 the prior 0.05 left
+                              # total/lam_l_instr still trending downward
+                              # at step 600. Adam-normalized step size is
+                              # roughly LR-proportional; 2× LR ≈ 2× effective
+                              # progress per step.
 # (No projection_every: continuous PEZ doesn't snap to vocabulary.)
 
 # (No clip_model field: continuous PEZ optimizes embeddings in SD's own

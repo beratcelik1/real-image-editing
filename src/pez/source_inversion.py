@@ -74,6 +74,13 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
     # entries (no w(t)) stay isolated and cannot be served as cache
     # hits.
     _SDS_FORMULATION = "wt_dreamfusion_v1"
+    # Pipeline-shape tag. Bump when the *structure* of pez_invert_source
+    # changes (e.g., adding/removing a phase that affects the returned
+    # artifacts). "final_nt_v1" = post-SDS null-text re-optimization
+    # added so the returned (soft_prompt, null_text) pair is consistent
+    # rather than asymmetric. Prior caches (no final NT pass) cannot
+    # serve hits.
+    _PIPELINE_SHAPE = "final_nt_v1"
     config_str = (
         f"{config.loss_type}|cfg={config.cfg_scale}|"
         f"ts_sampling={config.timestep_sampling}|"
@@ -85,7 +92,8 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
         f"dtype={config.dtype}|"
         f"nt_opt_steps={_NULL_TEXT_OPT_STEPS}|nt_opt_lr={_NULL_TEXT_OPT_LR}|"
         f"inv_algo={_INVERSION_ALGO_VERSION}|"
-        f"sds={_SDS_FORMULATION}"
+        f"sds={_SDS_FORMULATION}|"
+        f"shape={_PIPELINE_SHAPE}"
     )
     h.update(config_str.encode("utf-8"))
     return h.hexdigest()[:16]
@@ -296,7 +304,41 @@ def pez_invert_source(
             progress_desc=f"PEZ-1 R{round_idx} (SDS)",
         )
 
-    # 6. Cache and return
+    # 6. Final null-text re-optimization for the last-round soft_prompt.
+    # During the alternating loop, each round's null_text was optimized
+    # for the *previous* round's soft_prompt before the SDS step that
+    # updated soft_prompt; that leaves the returned (soft_prompt,
+    # null_text) pair asymmetric — null_text is one step stale relative
+    # to soft_prompt. PEZ-2's L_source and the edit-time pipeline both
+    # consume this pair, so the staleness propagates to PEZ-2's SDS
+    # gradient and to the editing-time Mokady inversion. Re-running
+    # null-text optimization once with the final soft_prompt makes the
+    # pair consistent. Cost: one DDIM inversion + one null-text
+    # optimization pass (~ 5 min).
+    print("[PEZ-1 final null-text re-optimization] aligning null_text with R{} soft_prompt".format(config.num_rounds))
+    text_emb = _encode_soft_prompt(soft_prompt, text_encoder, tokenizer, dtype)
+    _, latents_traj = ddim_inversion(
+        image_latent,
+        text_emb,
+        uncond_emb,
+        unet,
+        scheduler,
+        num_steps=config.ddim_num_steps,
+        cfg_scale=config.cfg_scale,
+    )
+    null_text = null_text_optimization(
+        latents_traj,
+        text_emb,
+        uncond_emb,
+        unet,
+        scheduler,
+        num_steps=config.ddim_num_steps,
+        cfg_scale=config.cfg_scale,
+        opt_steps=_NULL_TEXT_OPT_STEPS,
+        lr=_NULL_TEXT_OPT_LR,
+    )
+
+    # 7. Cache and return
     if config.use_cache:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
