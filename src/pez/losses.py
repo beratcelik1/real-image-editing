@@ -353,7 +353,10 @@ def sds_cfg_loss_from_encoded(
     dtype = unet.dtype
 
     eps = torch.randn_like(image_latent)
-    alpha_cumprod_t = scheduler.alphas_cumprod[t].to(device=device, dtype=dtype)
+    # scheduler.alphas_cumprod lives on CPU; index with t.cpu() so the
+    # indexer matches the indexed tensor's device, then move the scalar
+    # result to the U-Net's device.
+    alpha_cumprod_t = scheduler.alphas_cumprod[t.cpu()].to(device=device, dtype=dtype)
     sqrt_alpha = alpha_cumprod_t.sqrt()
     sqrt_one_minus_alpha = (1 - alpha_cumprod_t).sqrt()
     x_t = sqrt_alpha * image_latent.to(device=device, dtype=dtype) + sqrt_one_minus_alpha * eps
