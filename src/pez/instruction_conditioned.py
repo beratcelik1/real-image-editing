@@ -64,6 +64,10 @@ def _hash_pez2(
     # .sum()→.mean() switch) stay isolated and cannot be served as
     # cache hits.
     l_anchor_formulation = "mean_v1"
+    # SDS-CFG loss formulation tag (mirrors source_inversion.py).
+    # "wt_dreamfusion_v1" = per-step MSE × (1 - ᾱ_t) — DreamFusion §3.2
+    # weighting. Prior plain-MSE caches stay isolated.
+    sds_formulation = "wt_dreamfusion_v1"
     cfg_str = (
         f"{config.source_loss_type}|cfg={config.cfg_scale}|"
         f"ts_sampling={config.timestep_sampling}|"
@@ -71,7 +75,7 @@ def _hash_pez2(
         f"warm={config.warm_start}|"
         f"steps={config.num_steps}|lr={config.learning_rate}|"
         f"seed={config.seed}|dtype={config.dtype}|"
-        f"l_anchor={l_anchor_formulation}"
+        f"l_anchor={l_anchor_formulation}|sds={sds_formulation}"
     )
     h.update(cfg_str.encode("utf-8"))
     return h.hexdigest()[:16]

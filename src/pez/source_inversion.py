@@ -67,6 +67,13 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
     # algorithm version explicitly so cache entries from the broken
     # CFG=7.5 era can't be served as hits.
     _INVERSION_ALGO_VERSION = "cfg1_v1"
+    # SDS-CFG loss formulation tag. Bump when the SDS surrogate changes
+    # in a way that shifts the optimum even for identical config (lr,
+    # cfg, etc). "wt_dreamfusion_v1" indicates per-step MSE multiplied
+    # by w(t) = 1-ᾱ_t (DreamFusion §3.2 weighting). Prior "plain_mse"
+    # entries (no w(t)) stay isolated and cannot be served as cache
+    # hits.
+    _SDS_FORMULATION = "wt_dreamfusion_v1"
     config_str = (
         f"{config.loss_type}|cfg={config.cfg_scale}|"
         f"ts_sampling={config.timestep_sampling}|"
@@ -77,7 +84,8 @@ def _hash_image_and_config(image: Image.Image, config: Pez1Config) -> str:
         f"R={config.num_rounds}|seed={config.seed}|"
         f"dtype={config.dtype}|"
         f"nt_opt_steps={_NULL_TEXT_OPT_STEPS}|nt_opt_lr={_NULL_TEXT_OPT_LR}|"
-        f"inv_algo={_INVERSION_ALGO_VERSION}"
+        f"inv_algo={_INVERSION_ALGO_VERSION}|"
+        f"sds={_SDS_FORMULATION}"
     )
     h.update(config_str.encode("utf-8"))
     return h.hexdigest()[:16]

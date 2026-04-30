@@ -371,4 +371,13 @@ def sds_cfg_loss_from_encoded(
     ).sample
     eps_cfg = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
 
-    return F.mse_loss(eps_cfg.float(), eps.float())
+    # DreamFusion-style w(t) = 1 - ᾱ_t = σ_t² weighting (Poole et al.
+    # 2022, §3.2). Down-weights low-noise (small-t) timesteps where
+    # the score signal is small relative to the (eps_pred - eps) noise
+    # floor, equalizing the per-step SDS gradient signal across the
+    # uniform t sampler. Without this, plain-MSE SDS suffers from
+    # high gradient variance at small t — the same property that
+    # forced movement-based (rather than loss-based) early stopping in
+    # src/pez/search.py.
+    w_t = (1.0 - alpha_cumprod_t).float()
+    return w_t * F.mse_loss(eps_cfg.float(), eps.float())
