@@ -147,3 +147,40 @@ def dino_similarity(source_image: Image.Image, target_image: Image.Image, edited
     similarity = torch.cosine_similarity(source_to_target, source_to_edited, dim=-1).item()
     
     return similarity
+
+
+def clip_text_image_similarity(image: Image.Image, text: str, device: torch.device = None) -> float:
+    """Compute CLIP similarity between an image and text prompt.
+    
+    Args:
+        image: Input image
+        text: Text prompt
+        device: Device to run on
+        
+    Returns:
+        Cosine similarity score (higher = more similar)
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load CLIP model
+    model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
+    model = model.to(device).eval()
+    tokenizer = open_clip.get_tokenizer('ViT-B-32')
+    
+    # Preprocess image and text
+    image_tensor = preprocess(image).unsqueeze(0).to(device)
+    text_tokens = tokenizer([text]).to(device)
+    
+    with torch.no_grad():
+        image_emb = model.encode_image(image_tensor)
+        text_emb = model.encode_text(text_tokens)
+    
+    # Normalize embeddings
+    image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
+    text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
+    
+    # Cosine similarity
+    similarity = torch.matmul(image_emb, text_emb.t()).item()
+    
+    return similarity
